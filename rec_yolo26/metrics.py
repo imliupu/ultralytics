@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
 
 from .ops import batch_probiou, box_iou, xywh_to_xyxy
@@ -15,6 +14,8 @@ class EvalConfig:
     conf: float = 0.001
     iou: float = 0.7
     max_det: int = 300
+    split: str = "val"
+    save_dir: str = "runs/rec_yolo26/val"
 
 
 class Metric:
@@ -206,6 +207,7 @@ def build_metric_evaluator(task: str, names: dict[int, str]):
 
 @torch.inference_mode()
 def evaluate_model(model, dataloader, device: torch.device, task: str, names: dict[int, str], config: EvalConfig | None = None):
+    """Evaluate with the original Ultralytics validator logic and metrics."""
     config = config or EvalConfig()
     evaluator = build_metric_evaluator(task, names)
     model.eval()

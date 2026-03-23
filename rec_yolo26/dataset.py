@@ -2,9 +2,6 @@ from __future__ import annotations
 
 import colorsys
 import os
-import random
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -15,49 +12,12 @@ from torch.utils.data import DataLoader, Dataset
 from .ops import yaml_load
 
 SUPPORTED_TASKS = frozenset({"detect", "obb"})
-IMG_FORMATS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
-
-
-@dataclass
-class AugmentConfig:
-    hsv_h: float = 0.015
-    hsv_s: float = 0.7
-    hsv_v: float = 0.4
-    fliplr: float = 0.5
-    flipud: float = 0.0
 
 
 def load_data_config(data_yaml: str | os.PathLike[str]) -> dict[str, Any]:
-    path = Path(data_yaml).resolve()
-    data = yaml_load(path)
-    root = Path(data.get("path", path.parent))
-    if not root.is_absolute():
-        root = (path.parent / root).resolve()
-    data["path"] = str(root)
-    for split in ("train", "val", "test"):
-        value = data.get(split)
-        if value is None:
-            continue
-        split_path = Path(value)
-        data[split] = str((root / split_path).resolve()) if not split_path.is_absolute() else str(split_path.resolve())
-    names = data.get("names", {})
-    if isinstance(names, list):
-        names = {i: name for i, name in enumerate(names)}
-    data["names"] = names
-    data["nc"] = len(names)
-    data.setdefault("channels", 3)
-    return data
+    """Load data YAML with the original Ultralytics dataset checker."""
+    return check_det_dataset(str(data_yaml), autodownload=False)
 
-
-def list_images(path_like: str) -> list[Path]:
-    path = Path(path_like)
-    if path.is_file() and path.suffix == ".txt":
-        return [Path(x.strip()) for x in path.read_text().splitlines() if x.strip()]
-    if path.is_dir():
-        return sorted(x for x in path.rglob("*") if x.suffix.lower() in IMG_FORMATS)
-    if path.is_file() and path.suffix.lower() in IMG_FORMATS:
-        return [path]
-    raise FileNotFoundError(f"Unsupported image source: {path_like}")
 
 
 def letterbox(image: Image.Image, new_shape: int) -> tuple[Image.Image, float, tuple[int, int]]:
@@ -196,7 +156,27 @@ def build_dataloader(dataset: YOLO26Dataset, batch_size: int, workers: int, shuf
 
 def create_train_val_dataloaders(data_yaml: str | os.PathLike[str], task: str, imgsz: int, batch_size: int, workers: int, eval_split: str = "val", stride: int = 32):
     data = load_data_config(data_yaml)
-    train_loader = build_dataloader(build_dataset(data, "train", task, imgsz, augment=True), batch_size=batch_size, workers=workers, shuffle=True)
+    train_dataset = build_dataset(
+        data,
+        "train",
+        task,
+        imgsz,
+        augment=True,
+        batch_size=batch_size,
+        stride=stride,
+        args_overrides={"workers": workers, **(args_overrides or {})},
+    )
     split = eval_split if eval_split in data and data.get(eval_split) else "val"
-    eval_loader = build_dataloader(build_dataset(data, split, task, imgsz, augment=False), batch_size=batch_size, workers=workers, shuffle=False)
+    eval_dataset = build_dataset(
+        data,
+        split,
+        task,
+        imgsz,
+        augment=False,
+        batch_size=batch_size,
+        stride=stride,
+        args_overrides={"workers": workers, **(args_overrides or {})},
+    )
+    train_loader = build_dataloader(train_dataset, batch=batch_size, workers=workers, shuffle=True, rank=-1)
+    eval_loader = build_dataloader(eval_dataset, batch=batch_size, workers=workers, shuffle=False, rank=-1)
     return data, train_loader, eval_loader
