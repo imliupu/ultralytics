@@ -3,42 +3,31 @@ from __future__ import annotations
 import argparse
 import json
 
-import torch
+from ultralytics import YOLO
 
-from rec_yolo26.dataset import create_train_val_dataloaders, load_data_config
-from rec_yolo26.metrics import EvalConfig, evaluate_model
 from rec_yolo26.model import RecYOLO26Model
 
 
 def main(args):
-    device = torch.device(args.device)
-    data = load_data_config(args.data)
-    model = RecYOLO26Model.build(task=args.task, nc=data["nc"], model=args.model, verbose=not args.quiet)
-    model.load(args.weights, strict=False)
-    model.to(device)
-    model.names = data["names"]
-
-    _, _, dataloader = create_train_val_dataloaders(
-        data_yaml=args.data,
-        task=args.task,
+    cfg_path = RecYOLO26Model.resolve_model_cfg(args.model, args.task)
+    model = YOLO(str(cfg_path), task=args.task).load(args.weights)
+    metrics = model.val(
+        data=args.data,
         imgsz=args.imgsz,
-        batch_size=args.batch,
+        batch=args.batch,
         workers=args.workers,
-        eval_split=args.split,
+        device=args.device,
+        conf=args.conf,
+        iou=args.iou,
+        max_det=args.max_det,
+        split=args.split,
     )
-    metrics = evaluate_model(
-        model=model,
-        dataloader=dataloader,
-        device=device,
-        task=args.task,
-        names=data["names"],
-        config=EvalConfig(conf=args.conf, iou=args.iou, max_det=args.max_det),
-    )
-    print(json.dumps({k: float(v) for k, v in metrics.items()}, ensure_ascii=False, indent=2))
+    results = getattr(metrics, "results_dict", {}) or {}
+    print(json.dumps({k: float(v) for k, v in results.items()}, ensure_ascii=False, indent=2))
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="Standalone YOLO26 / YOLO26-OBB test entrypoint.")
+    parser = argparse.ArgumentParser(description="Ultralytics-aligned YOLO26 / YOLO26-OBB test entrypoint.")
     parser.add_argument("--task", choices=["detect", "obb"], required=True)
     parser.add_argument("--model", default="yolo26")
     parser.add_argument("--data", required=True)

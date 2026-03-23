@@ -1,4 +1,4 @@
-"""Standalone simplified YOLO26 / YOLO26-OBB training project."""
+"""Ultralytics-aligned YOLO26 / YOLO26-OBB wrapper package."""
 
 from importlib import import_module
 
