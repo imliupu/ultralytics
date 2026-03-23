@@ -9,25 +9,19 @@ from rec_yolo26.model import RecYOLO26Model
 
 
 def main(args):
-    cfg_path = RecYOLO26Model.resolve_model_cfg(args.model, args.task)
-    model = YOLO(str(cfg_path), task=args.task).load(args.weights)
-    metrics = model.val(
-        data=args.data,
-        imgsz=args.imgsz,
-        batch=args.batch,
-        workers=args.workers,
-        device=args.device,
-        conf=args.conf,
-        iou=args.iou,
-        max_det=args.max_det,
-        split=args.split,
-    )
-    results = getattr(metrics, "results_dict", {}) or {}
-    print(json.dumps({k: float(v) for k, v in results.items()}, ensure_ascii=False, indent=2))
+    device = torch.device(args.device)
+    data = load_data_config(args.data)
+    model = RecYOLO26Model.build(task=args.task, nc=data["nc"], model=args.model, verbose=not args.quiet)
+    model.load(args.weights, strict=False)
+    model.to(device)
+    model.names = data["names"]
+    _, _, dataloader = create_train_val_dataloaders(args.data, args.task, args.imgsz, args.batch, args.workers, eval_split=args.split)
+    metrics = evaluate_model(model, dataloader, device, args.task, data["names"], EvalConfig(conf=args.conf, iou=args.iou, max_det=args.max_det))
+    print(json.dumps({k: float(v) for k, v in metrics.items()}, ensure_ascii=False, indent=2))
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="Ultralytics-aligned YOLO26 / YOLO26-OBB test entrypoint.")
+    parser = argparse.ArgumentParser(description="Standalone self-contained YOLO26 / YOLO26-OBB test entrypoint.")
     parser.add_argument("--task", choices=["detect", "obb"], required=True)
     parser.add_argument("--model", default="yolo26")
     parser.add_argument("--data", required=True)
