@@ -53,26 +53,17 @@ SOLUTION_MAP = {
 
 # Define valid tasks and modes
 MODES = frozenset({"train", "val", "predict", "export", "track", "benchmark"})
-TASKS = frozenset({"detect", "segment", "classify", "pose", "obb"})
+TASKS = frozenset({"detect", "obb"})
 TASK2DATA = {
     "detect": "coco8.yaml",
-    "segment": "coco8-seg.yaml",
-    "classify": "imagenet10",
-    "pose": "coco8-pose.yaml",
     "obb": "dota8.yaml",
 }
 TASK2MODEL = {
     "detect": "yolo26n.pt",
-    "segment": "yolo26n-seg.pt",
-    "classify": "yolo26n-cls.pt",
-    "pose": "yolo26n-pose.pt",
     "obb": "yolo26n-obb.pt",
 }
 TASK2METRIC = {
     "detect": "metrics/mAP50-95(B)",
-    "segment": "metrics/mAP50-95(M)",
-    "classify": "metrics/accuracy_top1",
-    "pose": "metrics/mAP50-95(P)",
     "obb": "metrics/mAP50-95(B)",
 }
 
@@ -117,17 +108,17 @@ CLI_HELP_MSG = f"""
                 ARGS (optional) are any number of custom 'arg=value' pairs like 'imgsz=320' that override defaults.
                     See all ARGS at https://docs.ultralytics.com/usage/cfg or with 'yolo cfg'
 
-    1. Train a detection model for 10 epochs with an initial learning_rate of 0.01
-        yolo train data=coco8.yaml model=yolo26n.pt epochs=10 lr0=0.01
+    1. Train a YOLO26 detection model for 10 epochs with an initial learning rate of 0.01
+        yolo detect train data=coco8.yaml model=yolo26n.pt epochs=10 lr0=0.01
 
-    2. Predict a YouTube video using a pretrained segmentation model at image size 320:
-        yolo predict model=yolo26n-seg.pt source='https://youtu.be/LNwODJXcvt4' imgsz=320
+    2. Predict an image using a pretrained YOLO26-OBB model at image size 1024:
+        yolo obb predict model=yolo26n-obb.pt source='https://ultralytics.com/images/boats.jpg' imgsz=1024
 
-    3. Validate a pretrained detection model at batch-size 1 and image size 640:
-        yolo val model=yolo26n.pt data=coco8.yaml batch=1 imgsz=640
+    3. Validate a pretrained YOLO26 detection model at batch-size 1 and image size 640:
+        yolo detect val model=yolo26n.pt data=coco8.yaml batch=1 imgsz=640
 
-    4. Export a YOLO26n classification model to ONNX format at image size 224 by 128 (no TASK required)
-        yolo export model=yolo26n-cls.pt format=onnx imgsz=224,128
+    4. Export a YOLO26-OBB model to ONNX format:
+        yolo obb export model=yolo26n-obb.pt format=onnx imgsz=1024
 
     5. Ultralytics solutions usage
         yolo solutions count or any of {list(SOLUTION_MAP.keys())[1:-1]} source="path/to/video.mp4"
@@ -141,6 +132,7 @@ CLI_HELP_MSG = f"""
         yolo cfg
         yolo solutions help
 
+    This slimmed repository intentionally supports only YOLO26 detect and YOLO26-OBB.
     Docs: https://docs.ultralytics.com
     Solutions: https://docs.ultralytics.com/solutions/
     Community: https://community.ultralytics.com
