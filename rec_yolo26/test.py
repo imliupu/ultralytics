@@ -24,7 +24,6 @@ def main(args):
         imgsz=args.imgsz,
         batch_size=args.batch,
         workers=args.workers,
-        stride=int(max(model.stride.max().item(), 32)),
         eval_split=args.split,
     )
     metrics = evaluate_model(

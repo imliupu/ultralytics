@@ -49,8 +49,7 @@ def main(args):
         task=args.task,
         imgsz=args.imgsz,
         batch_size=args.batch,
-        workers=args.workers,
-        stride=int(max(model.stride.max().item(), 32)),
+        workers=args.workers
     )
 
     model = RecYOLO26Model.build(task=args.task, nc=data["nc"], model=args.model, verbose=not args.quiet)
@@ -82,10 +81,10 @@ def main(args):
         print(json.dumps(metrics_row, ensure_ascii=False))
 
         fitness = metrics_row.get("metrics/mAP50-95(B)", 0.0)
-        model.save(save_dir / "last.pt", epoch=epoch + 1, optimizer=optimizer.state_dict(), metrics=metrics_row)
+        model.save_checkpoint(save_dir / "last.pt", epoch=epoch + 1, optimizer=optimizer.state_dict(), metrics=metrics_row)
         if fitness >= best_fitness:
             best_fitness = fitness
-            model.save(save_dir / "best.pt", epoch=epoch + 1, optimizer=optimizer.state_dict(), metrics=metrics_row)
+            model.save_checkpoint(save_dir / "best.pt", epoch=epoch + 1, optimizer=optimizer.state_dict(), metrics=metrics_row)
 
     with open(save_dir / "history.json", "w", encoding="utf-8") as f:
         json.dump(history, f, ensure_ascii=False, indent=2)

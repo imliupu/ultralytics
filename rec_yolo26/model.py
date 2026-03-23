@@ -33,7 +33,7 @@ class RecYOLO26Model(nn.Module):
     def __init__(self, layers: nn.ModuleList, save: list[int], task: str, nc: int, ch: int = 3):
         super().__init__()
         self.model = layers
-        self.save = save
+        self.save_indices = save
         self.task = task
         self.nc = nc
         self.ch = ch
@@ -73,6 +73,9 @@ class RecYOLO26Model(nn.Module):
 
     def save_checkpoint(self, path: str | Path, **extra: Any) -> None:
         torch.save({"model": self.state_dict(), "task": self.task, "names": self.names, **extra}, path)
+
+    def save(self, path: str | Path, **extra: Any) -> None:
+        self.save_checkpoint(path, **extra)
 
     def load(self, path: str | Path, strict: bool = True) -> None:
         checkpoint = torch.load(path, map_location="cpu")

@@ -14,6 +14,7 @@ from .ops import xywh_to_xyxy, xywhr_to_xyxy
 class EvalConfig:
     conf: float = 0.001
     iou: float = 0.7
+    max_det: int = 300
 
 
 class BaseMetricEvaluator:
