@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional, Union
 
 import numpy as np
 import torch
@@ -27,7 +27,7 @@ MODULES = {
 }
 
 
-def yaml_load(path: str | Path) -> dict[str, Any]:
+def yaml_load(path: Union[str, Path]) -> dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
@@ -165,7 +165,7 @@ def dist2bbox(distance: torch.Tensor, anchor_points: torch.Tensor, xywh: bool = 
     return torch.cat((x1y1, x2y2), dim)
 
 
-def bbox2dist(anchor_points: torch.Tensor, bbox: torch.Tensor, reg_max: int | None = None) -> torch.Tensor:
+def bbox2dist(anchor_points: torch.Tensor, bbox: torch.Tensor, reg_max: Optional[int] = None) -> torch.Tensor:
     x1y1, x2y2 = bbox.chunk(2, -1)
     dist = torch.cat((anchor_points - x1y1, x2y2 - anchor_points), -1)
     return dist.clamp_(0, reg_max - 0.01) if reg_max is not None else dist
@@ -180,7 +180,7 @@ def dist2rbox(pred_dist: torch.Tensor, pred_angle: torch.Tensor, anchor_points: 
     return torch.cat((xy, lt + rb), dim=dim)
 
 
-def rbox2dist(target_bboxes: torch.Tensor, anchor_points: torch.Tensor, target_angle: torch.Tensor, reg_max: int | None = None):
+def rbox2dist(target_bboxes: torch.Tensor, anchor_points: torch.Tensor, target_angle: torch.Tensor, reg_max: Optional[int] = None):
     xy, wh = target_bboxes.split(2, dim=-1)
     offset = xy - anchor_points
     offset_x, offset_y = offset.split(1, dim=-1)
@@ -251,7 +251,7 @@ def non_max_suppression(prediction: torch.Tensor, conf_thres=0.25, iou_thres=0.4
     return output
 
 
-def build_model_from_yaml(cfg: dict[str, Any], task: str, scale: str = "n", ch: int = 3, nc: int | None = None):
+def build_model_from_yaml(cfg: dict[str, Any], task: str, scale: str = "n", ch: int = 3, nc: Optional[int] = None):
     cfg = deepcopy(cfg)
     depth, width, max_channels = cfg.get("scales", {}).get(scale, cfg.get("scales", {}).get("n", [1.0, 1.0, 1024]))
     if nc is not None:

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -33,7 +33,7 @@ class RecYOLO26Model(nn.Module):
     def __init__(self, layers: nn.ModuleList, save: list[int], task: str, cfg: dict[str, Any], cfg_path: Path, ch: int = 3):
         super().__init__()
         self.model = layers
-        self.save = save
+        self.save_layers = save
         self.task = task
         self.cfg = cfg
         self.cfg_path = Path(cfg_path)
@@ -56,7 +56,7 @@ class RecYOLO26Model(nn.Module):
         return CONFIG_DIR / ("yolo26-obb.yaml" if task == "obb" or key.endswith("-obb") else "yolo26.yaml")
 
     @classmethod
-    def build(cls, task: str, nc: int, model: str = "yolo26", scale: str = "n", ch: int = 3, verbose: bool = False, args_overrides: dict[str, Any] | None = None):
+    def build(cls, task: str, nc: int, model: str = "yolo26", scale: str = "n", ch: int = 3, verbose: bool = False, args_overrides: Optional[dict[str, Any]] = None):
         cfg_path = cls.resolve_model_cfg(model, task)
         cfg = yaml_load(cfg_path)
         layers, save, cfg = build_model_from_yaml(cfg=cfg, task=task, scale=scale, ch=ch, nc=nc)
@@ -74,7 +74,7 @@ class RecYOLO26Model(nn.Module):
             if m.f != -1:
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
             x = m(x)
-            y.append(x if m.i in self.save else None)
+            y.append(x if m.i in self.save_layers else None)
         return x
 
     def forward(self, x):
@@ -129,7 +129,7 @@ class RecYOLO26Model(nn.Module):
             max_det=max_det,
             nc=self.nc,
             rotated=self.task == "obb",
-            end2end=self.end2end,
+            end2end=False,
         )
         formatted = []
         for x in outputs:
@@ -138,7 +138,7 @@ class RecYOLO26Model(nn.Module):
             formatted.append({"bboxes": bboxes, "conf": x[:, 4], "cls": x[:, 5]})
         return formatted
 
-    def load(self, path: str | Path, strict: bool = True) -> None:
+    def load(self, path: Union[str, Path], strict: bool = True) -> None:
         checkpoint = torch.load(path, map_location="cpu")
         state_dict = checkpoint.get("model", checkpoint)
         if hasattr(state_dict, "state_dict"):
@@ -147,8 +147,8 @@ class RecYOLO26Model(nn.Module):
         self.names = checkpoint.get("names", self.names)
         self.model.names = self.names
 
-    def save_checkpoint(self, path: str | Path, **extra: Any) -> None:
+    def save_checkpoint(self, path: Union[str, Path], **extra: Any) -> None:
         torch.save({"model": self.state_dict(), "task": self.task, "names": self.names, **extra}, path)
 
-    def save(self, path: str | Path, **extra: Any) -> None:
+    def save(self, path: Union[str, Path], **extra: Any) -> None:
         self.save_checkpoint(path, **extra)

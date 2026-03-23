@@ -182,7 +182,7 @@ class RotatedTaskAlignedAssigner(TaskAlignedAssigner):
 
 
 class v8DetectionLoss:
-    def __init__(self, model, tal_topk: int = 10, tal_topk2: int | None = None):
+    def __init__(self, model, tal_topk: int = 10, tal_topk2=None):
         device = next(model.parameters()).device
         h = model.args
         m = model.model[-1]
@@ -259,7 +259,7 @@ class v8DetectionLoss:
 
 
 class v8OBBLoss(v8DetectionLoss):
-    def __init__(self, model, tal_topk=10, tal_topk2: int | None = None):
+    def __init__(self, model, tal_topk=10, tal_topk2=None):
         super().__init__(model, tal_topk=tal_topk)
         self.assigner = RotatedTaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0, stride=self.stride.tolist(), topk2=tal_topk2)
         self.bbox_loss = RotatedBboxLoss(self.reg_max).to(self.device)
@@ -353,7 +353,7 @@ class E2ELoss:
         self.o2o = max(self.total - self.o2m, 0)
 
 
-def build_criterion(model: Any, task: str | None = None, args_overrides: dict | None = None):
+def build_criterion(model: Any, task: str = None, args_overrides: dict = None):
     if args_overrides:
         for k, v in args_overrides.items():
             setattr(model.args, k, v)

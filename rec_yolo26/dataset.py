@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-import colorsys
 import os
-from typing import Any
+import random
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Optional, Union
 
 import numpy as np
 import torch
-from PIL import Image, ImageEnhance, ImageOps
+from PIL import Image, ImageOps
 from torch.utils.data import DataLoader, Dataset
 
 from .ops import yaml_load
@@ -18,6 +20,38 @@ def load_data_config(data_yaml: str | os.PathLike[str]) -> dict[str, Any]:
     """Load data YAML with the original Ultralytics dataset checker."""
     return check_det_dataset(str(data_yaml), autodownload=False)
 
+
+def load_data_config(data_yaml: Union[str, os.PathLike]) -> dict[str, Any]:
+    path = Path(data_yaml).resolve()
+    data = yaml_load(path)
+    root = Path(data.get("path", path.parent))
+    if not root.is_absolute():
+        root = (path.parent / root).resolve()
+    data["path"] = str(root)
+    for split in ("train", "val", "test"):
+        value = data.get(split)
+        if value is None:
+            continue
+        split_path = Path(value)
+        data[split] = str((root / split_path).resolve()) if not split_path.is_absolute() else str(split_path.resolve())
+    names = data.get("names", {})
+    if isinstance(names, list):
+        names = {i: name for i, name in enumerate(names)}
+    data["names"] = names
+    data["nc"] = len(names)
+    data.setdefault("channels", 3)
+    return data
+
+
+def list_images(path_like: str) -> list[Path]:
+    path = Path(path_like)
+    if path.is_file() and path.suffix == ".txt":
+        return [Path(x.strip()) for x in path.read_text().splitlines() if x.strip()]
+    if path.is_dir():
+        return sorted(x for x in path.rglob("*") if x.suffix.lower() in IMG_FORMATS)
+    if path.is_file() and path.suffix.lower() in IMG_FORMATS:
+        return [path]
+    raise FileNotFoundError(f"Unsupported image source: {path_like}")
 
 
 def letterbox(image: Image.Image, new_shape: int) -> tuple[Image.Image, float, tuple[int, int]]:
@@ -53,7 +87,7 @@ def polygon_to_xywhr(points: np.ndarray) -> np.ndarray:
 
 
 class YOLO26Dataset(Dataset):
-    def __init__(self, image_root: str, task: str, imgsz: int, augment: bool, names: dict[int, str], augment_cfg: AugmentConfig | None = None):
+    def __init__(self, image_root: str, task: str, imgsz: int, augment: bool, names: dict[int, str], augment_cfg: Optional[AugmentConfig] = None):
         if task not in SUPPORTED_TASKS:
             raise NotImplementedError(f"Only {sorted(SUPPORTED_TASKS)} are supported, but got '{task}'.")
         self.task = task
@@ -154,7 +188,7 @@ def build_dataloader(dataset: YOLO26Dataset, batch_size: int, workers: int, shuf
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=workers, pin_memory=True, collate_fn=dataset.collate_fn)
 
 
-def create_train_val_dataloaders(data_yaml: str | os.PathLike[str], task: str, imgsz: int, batch_size: int, workers: int, eval_split: str = "val", stride: int = 32):
+def create_train_val_dataloaders(data_yaml: Union[str, os.PathLike], task: str, imgsz: int, batch_size: int, workers: int, eval_split: str = "val", stride: int = 32):
     data = load_data_config(data_yaml)
     train_dataset = build_dataset(
         data,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import torch
 
@@ -206,8 +206,7 @@ def build_metric_evaluator(task: str, names: dict[int, str]):
 
 
 @torch.inference_mode()
-def evaluate_model(model, dataloader, device: torch.device, task: str, names: dict[int, str], config: EvalConfig | None = None):
-    """Evaluate with the original Ultralytics validator logic and metrics."""
+def evaluate_model(model, dataloader, device: torch.device, task: str, names: dict[int, str], config: Optional[EvalConfig] = None):
     config = config or EvalConfig()
     evaluator = build_metric_evaluator(task, names)
     model.eval()

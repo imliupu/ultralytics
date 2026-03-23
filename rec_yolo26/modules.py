@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 
 
-def autopad(k: int | tuple[int, int], p: int | None = None, d: int = 1):
+def autopad(k, p=None, d: int = 1):
     if d > 1:
         if isinstance(k, int):
             k = d * (k - 1) + 1
