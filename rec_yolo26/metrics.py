@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-import numpy as np
 import torch
 
 from .ops import batch_probiou, box_iou, xywh_to_xyxy
@@ -15,6 +14,8 @@ class EvalConfig:
     conf: float = 0.001
     iou: float = 0.7
     max_det: int = 300
+    split: str = "val"
+    save_dir: str = "runs/rec_yolo26/val"
 
 
 class Metric:

@@ -11,12 +11,13 @@ import torch.nn as nn
 from .loss import build_criterion
 from .ops import build_model_from_yaml, dist2bbox, dist2rbox, make_anchors, non_max_suppression, yaml_load
 
-CONFIG_DIR = Path(__file__).resolve().parent / "configs"
+CONFIG_DIR = Path(__file__).resolve().parents[1] / "ultralytics" / "cfg" / "models" / "26"
 MODEL_ALIASES = {
     "yolo26": CONFIG_DIR / "yolo26.yaml",
     "yolo26-obb": CONFIG_DIR / "yolo26-obb.yaml",
     "yolo26obb": CONFIG_DIR / "yolo26-obb.yaml",
 }
+MODEL_BY_TASK = {"detect": DetectionModel, "obb": OBBModel}
 
 
 @dataclass
@@ -142,8 +143,9 @@ class RecYOLO26Model(nn.Module):
         state_dict = checkpoint.get("model", checkpoint)
         if hasattr(state_dict, "state_dict"):
             state_dict = state_dict.state_dict()
-        self.load_state_dict(state_dict, strict=strict)
+        self.model.load_state_dict(state_dict, strict=strict)
         self.names = checkpoint.get("names", self.names)
+        self.model.names = self.names
 
     def save_checkpoint(self, path: Union[str, Path], **extra: Any) -> None:
         torch.save({"model": self.state_dict(), "task": self.task, "names": self.names, **extra}, path)

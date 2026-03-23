@@ -4,9 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-import torch
-from torch import optim
-from tqdm import tqdm
+from ultralytics import YOLO
 
 from rec_yolo26.dataset import create_train_val_dataloaders
 from rec_yolo26.metrics import EvalConfig, evaluate_model
@@ -79,7 +77,7 @@ def build_parser():
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--lr0", type=float, default=1e-3)
+    parser.add_argument("--lr0", type=float, default=0.01)
     parser.add_argument("--weight_decay", type=float, default=5e-4)
     parser.add_argument("--conf", type=float, default=0.001)
     parser.add_argument("--iou", type=float, default=0.7)

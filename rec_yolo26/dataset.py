@@ -14,16 +14,11 @@ from torch.utils.data import DataLoader, Dataset
 from .ops import yaml_load
 
 SUPPORTED_TASKS = frozenset({"detect", "obb"})
-IMG_FORMATS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
 
-@dataclass
-class AugmentConfig:
-    hsv_h: float = 0.015
-    hsv_s: float = 0.7
-    hsv_v: float = 0.4
-    fliplr: float = 0.5
-    flipud: float = 0.0
+def load_data_config(data_yaml: str | os.PathLike[str]) -> dict[str, Any]:
+    """Load data YAML with the original Ultralytics dataset checker."""
+    return check_det_dataset(str(data_yaml), autodownload=False)
 
 
 def load_data_config(data_yaml: Union[str, os.PathLike]) -> dict[str, Any]:
@@ -195,7 +190,27 @@ def build_dataloader(dataset: YOLO26Dataset, batch_size: int, workers: int, shuf
 
 def create_train_val_dataloaders(data_yaml: Union[str, os.PathLike], task: str, imgsz: int, batch_size: int, workers: int, eval_split: str = "val", stride: int = 32):
     data = load_data_config(data_yaml)
-    train_loader = build_dataloader(build_dataset(data, "train", task, imgsz, augment=True), batch_size=batch_size, workers=workers, shuffle=True)
+    train_dataset = build_dataset(
+        data,
+        "train",
+        task,
+        imgsz,
+        augment=True,
+        batch_size=batch_size,
+        stride=stride,
+        args_overrides={"workers": workers, **(args_overrides or {})},
+    )
     split = eval_split if eval_split in data and data.get(eval_split) else "val"
-    eval_loader = build_dataloader(build_dataset(data, split, task, imgsz, augment=False), batch_size=batch_size, workers=workers, shuffle=False)
+    eval_dataset = build_dataset(
+        data,
+        split,
+        task,
+        imgsz,
+        augment=False,
+        batch_size=batch_size,
+        stride=stride,
+        args_overrides={"workers": workers, **(args_overrides or {})},
+    )
+    train_loader = build_dataloader(train_dataset, batch=batch_size, workers=workers, shuffle=True, rank=-1)
+    eval_loader = build_dataloader(eval_dataset, batch=batch_size, workers=workers, shuffle=False, rank=-1)
     return data, train_loader, eval_loader
