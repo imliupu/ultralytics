@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
-from torchvision.ops import box_iou
 
-from .ops import xywh_to_xyxy, xywhr_to_xyxy
+from ultralytics.cfg import get_cfg
+from ultralytics.models import yolo
+from ultralytics.utils import DEFAULT_CFG
 
 
 @dataclass
@@ -15,89 +16,56 @@ class EvalConfig:
     conf: float = 0.001
     iou: float = 0.7
     max_det: int = 300
+    split: str = "val"
+    save_dir: str = "runs/rec_yolo26/val"
 
 
-class BaseMetricEvaluator:
-    def __init__(self, task: str, names: dict[int, str]):
-        self.task = task
-        self.names = names
-        self.stats = {"tp": [], "conf": [], "pred_cls": [], "target_cls": []}
-        self.iou_threshold = 0.5
-
-    def reset(self) -> None:
-        for v in self.stats.values():
-            v.clear()
-
-    def _pair_iou(self, gt: torch.Tensor, pred: torch.Tensor) -> torch.Tensor:
-        if self.task == "obb":
-            return box_iou(xywhr_to_xyxy(gt), xywhr_to_xyxy(pred))
-        return box_iou(gt, pred)
-
-    def update(self, preds: list[dict[str, torch.Tensor]], batch: dict[str, Any]) -> None:
-        img_h, img_w = batch["img"].shape[-2:]
-        for sample_index, pred in enumerate(preds):
-            idx = batch["batch_idx"] == sample_index
-            gt_boxes = batch["bboxes"][idx].to(pred["bboxes"].device).clone()
-            gt_cls = batch["cls"][idx].view(-1).to(pred["cls"].device)
-            if gt_boxes.numel():
-                if self.task == "obb":
-                    gt_boxes[:, :4] *= gt_boxes.new_tensor([img_w, img_h, img_w, img_h])
-                else:
-                    gt_boxes = xywh_to_xyxy(gt_boxes) * gt_boxes.new_tensor([img_w, img_h, img_w, img_h])
-            pred_boxes = pred["bboxes"]
-            pred_cls = pred["cls"].view(-1)
-            pred_conf = pred["conf"].view(-1)
-            if gt_boxes.numel() == 0 or pred_boxes.numel() == 0:
-                tp = np.zeros((pred_boxes.shape[0],), dtype=bool)
-            else:
-                iou = self._pair_iou(gt_boxes, pred_boxes)
-                matches = (iou >= self.iou_threshold).cpu().numpy()
-                tp = np.zeros((pred_boxes.shape[0],), dtype=bool)
-                for gt_index in range(matches.shape[0]):
-                    pred_indices = np.where(matches[gt_index])[0]
-                    pred_indices = [idx for idx in pred_indices if int(pred_cls[idx]) == int(gt_cls[gt_index])]
-                    if pred_indices:
-                        best = max(pred_indices, key=lambda idx: float(pred_conf[idx]))
-                        tp[best] = True
-            self.stats["tp"].append(tp)
-            self.stats["conf"].append(pred_conf.detach().cpu().numpy())
-            self.stats["pred_cls"].append(pred_cls.detach().cpu().numpy())
-            self.stats["target_cls"].append(gt_cls.detach().cpu().numpy())
-
-    def compute(self) -> dict[str, float]:
-        tp = np.concatenate(self.stats["tp"], 0) if self.stats["tp"] else np.zeros((0,), dtype=bool)
-        conf = np.concatenate(self.stats["conf"], 0) if self.stats["conf"] else np.zeros((0,))
-        pred_cls = np.concatenate(self.stats["pred_cls"], 0) if self.stats["pred_cls"] else np.zeros((0,))
-        target_cls = np.concatenate(self.stats["target_cls"], 0) if self.stats["target_cls"] else np.zeros((0,))
-        tp_sum = tp.sum()
-        fp_sum = max(len(tp) - tp_sum, 0)
-        fn_sum = max(len(target_cls) - tp_sum, 0)
-        precision = float(tp_sum / max(tp_sum + fp_sum, 1))
-        recall = float(tp_sum / max(tp_sum + fn_sum, 1))
-        map50 = precision * recall
-        return {
-            "metrics/precision(B)": precision,
-            "metrics/recall(B)": recall,
-            "metrics/mAP50(B)": map50,
-            "metrics/mAP50-95(B)": map50,
-        }
+def build_metric_evaluator(task: str, names: dict[int, str], config: EvalConfig | None = None):
+    """Build the original Ultralytics validator used by YOLO26 detect/obb."""
+    config = config or EvalConfig()
+    args = get_cfg(
+        DEFAULT_CFG,
+        overrides={
+            "task": task,
+            "conf": config.conf,
+            "iou": config.iou,
+            "max_det": config.max_det,
+            "split": config.split,
+            "save_dir": config.save_dir,
+            "plots": False,
+            "save_json": False,
+            "save_txt": False,
+            "single_cls": False,
+            "agnostic_nms": False,
+        },
+    )
+    validator_cls = yolo.obb.OBBValidator if task == "obb" else yolo.detect.DetectionValidator
+    validator = validator_cls(dataloader=None, save_dir=Path(config.save_dir), args=args)
+    validator.data = {config.split: "", "names": names, "channels": 3}
+    return validator
 
 
 @torch.inference_mode()
 def evaluate_model(model, dataloader, device: torch.device, task: str, names: dict[int, str], config: EvalConfig | None = None):
+    """Evaluate with the original Ultralytics validator logic and metrics."""
     config = config or EvalConfig()
-    evaluator = BaseMetricEvaluator(task=task, names=names)
-    model.eval()
+    validator = build_metric_evaluator(task=task, names=names, config=config)
+    validator.device = device
+    validator.dataloader = dataloader
+    validator.training = False
+    validator.args.half = False
+    validator.args.plots = False
+    validator.args.model = getattr(model, "cfg_path", None) or getattr(getattr(model, "model", None), "yaml_file", None)
+    wrapped = getattr(model, "model", model)
+    wrapped.eval()
+    validator.init_metrics(wrapped)
+
     for batch in dataloader:
-        batch["img"] = batch["img"].to(device).float() / 255
-        batch["cls"] = batch["cls"].to(device)
-        batch["bboxes"] = batch["bboxes"].to(device)
-        batch["batch_idx"] = batch["batch_idx"].to(device)
-        raw_preds = model(batch["img"])
-        preds = model.postprocess(raw_preds, conf=config.conf, iou=config.iou)
-        evaluator.update(preds, batch)
-    return evaluator.compute()
+        batch = validator.preprocess(batch)
+        preds = wrapped(batch["img"])
+        preds = validator.postprocess(preds)
+        validator.update_metrics(preds, batch)
 
-
-def build_metric_evaluator(task: str, names: dict[int, str]) -> BaseMetricEvaluator:
-    return BaseMetricEvaluator(task=task, names=names)
+    stats = validator.get_stats()
+    validator.finalize_metrics()
+    return {k: float(v) for k, v in stats.items()}
