@@ -1,15 +1,14 @@
 # rec_yolo26
 
-一个独立的、面向二次开发/QAT 的 YOLO26 / YOLO26-OBB 简化项目骨架。
+一个**自包含的 YOLO26 / YOLO26-OBB 对齐实现**，不再依赖 `ultralytics` Python 包导入。
 
-## 文件说明
+## 当前实现原则
 
-- `dataset.py`: 数据集加载、增强、dataloader 构造
-- `model.py`: 模型静态构造、forward 输出 raw head、postprocess 独立
-- `loss.py`: detect / obb loss
-- `metrics.py`: detect / obb 指标与验证逻辑
-- `train_val.py`: 自己写的训练/验证循环
-- `test.py`: 独立测试脚本
+- `model.py`：按 `rec_yolo26/configs/*.yaml` 构建本地 `YOLO26` / `YOLO26-OBB` 网络，保留 `end2end=True`、`Detect`、`OBB26` 语义。
+- `loss.py`：内置 `TaskAlignedAssigner`、`RotatedTaskAlignedAssigner`、`v8DetectionLoss`、`v8OBBLoss` 和 `E2ELoss`，不再走外部 `ultralytics` 运行时。
+- `metrics.py`：本地实现 detect / obb 的 mAP 统计和 IoU / ProbIoU 匹配逻辑。
+- `dataset.py`：保留当前 `detect` / `obb` 所需的最小数据读取、letterbox、翻转和标签解析能力，并避免引入 OpenCV / ultralytics 依赖。
+- `train_val.py` / `test.py`：回到纯本地训练 / 验证 / 测试流程。
 
 ## 使用示例
 
@@ -18,11 +17,7 @@ python -m rec_yolo26.train_val --task detect --model yolo26 --data /path/to/your
 python -m rec_yolo26.train_val --task obb --model yolo26-obb --data /path/to/your_obb.yaml
 ```
 
-
-## 本地快速自测
-
 ```bash
-python -m rec_yolo26.tools.make_dummy_data --output rec_yolo26/demo_data
-python -m rec_yolo26.train_val --task detect --model yolo26 --data rec_yolo26/demo_data/detect.yaml --epochs 1 --batch 2 --workers 0 --imgsz 128
-python -m rec_yolo26.train_val --task obb --model yolo26-obb --data rec_yolo26/demo_data/obb.yaml --epochs 1 --batch 2 --workers 0 --imgsz 128
+python -m rec_yolo26.test --task detect --model yolo26 --data /path/to/your_detect.yaml --weights runs/rec_yolo26/best.pt
+python -m rec_yolo26.test --task obb --model yolo26-obb --data /path/to/your_obb.yaml --weights runs/rec_yolo26/best.pt
 ```

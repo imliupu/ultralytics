@@ -1,4 +1,4 @@
-"""Standalone simplified YOLO26 / YOLO26-OBB training project."""
+"""Self-contained YOLO26 / YOLO26-OBB package aligned to the local YOLO26 configs without importing ultralytics."""
 
 from importlib import import_module
 
