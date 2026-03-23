@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import torch
 import torch.nn as nn
 
-from .modules import Detect, OBB
-from .ops import build_model_from_yaml, make_grid, non_max_suppression, yaml_load
+from .loss import build_criterion
+from .ops import build_model_from_yaml, dist2bbox, dist2rbox, make_anchors, non_max_suppression, yaml_load
 
 CONFIG_DIR = Path(__file__).resolve().parent / "configs"
 MODEL_ALIASES = {
@@ -28,54 +29,113 @@ class ModelBuildConfig:
 
 
 class RecYOLO26Model(nn.Module):
-    """Standalone YOLO26 / YOLO26-OBB model without Ultralytics runtime dependency."""
-
-    def __init__(self, layers: nn.ModuleList, save: list[int], task: str, nc: int, ch: int = 3):
+    def __init__(self, layers: nn.ModuleList, save: list[int], task: str, cfg: dict[str, Any], cfg_path: Path, ch: int = 3):
         super().__init__()
         self.model = layers
-        self.save_indices = save
+        self.save = save
         self.task = task
-        self.nc = nc
+        self.cfg = cfg
+        self.cfg_path = Path(cfg_path)
         self.ch = ch
-        self.head = self.model[-1]
-        self.names = {i: str(i) for i in range(nc)}
-        self.stride = self._infer_stride(ch=ch)
+        self.nc = int(cfg["nc"])
+        self.names = {i: str(i) for i in range(self.nc)}
+        self.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5, angle=1.0, epochs=100)
+        self.end2end = bool(getattr(self.model[-1], "end2end", False))
+        self.criterion = None
+        self.stride = self._infer_stride(ch)
+        self.model[-1].stride = self.stride
 
     @staticmethod
     def resolve_model_cfg(model: str, task: str) -> Path:
         key = model.lower().replace("_", "-")
         if key in MODEL_ALIASES:
             return MODEL_ALIASES[key]
+        if Path(model).suffix in {".yaml", ".yml"}:
+            return Path(model)
         return CONFIG_DIR / ("yolo26-obb.yaml" if task == "obb" or key.endswith("-obb") else "yolo26.yaml")
 
     @classmethod
-    def build(
-        cls,
-        task: str,
-        nc: int,
-        model: str = "yolo26",
-        scale: str = "n",
-        ch: int = 3,
-        verbose: bool = False,
-        args_overrides: dict[str, Any] | None = None,
-    ) -> "RecYOLO26Model":
-        cfg = yaml_load(cls.resolve_model_cfg(model, task))
-        layers, save = build_model_from_yaml(cfg=cfg, task=task, scale=scale, ch=ch, nc=nc)
-        return cls(layers=layers, save=save, task=task, nc=nc, ch=ch)
+    def build(cls, task: str, nc: int, model: str = "yolo26", scale: str = "n", ch: int = 3, verbose: bool = False, args_overrides: dict[str, Any] | None = None):
+        cfg_path = cls.resolve_model_cfg(model, task)
+        cfg = yaml_load(cfg_path)
+        layers, save, cfg = build_model_from_yaml(cfg=cfg, task=task, scale=scale, ch=ch, nc=nc)
+        instance = cls(layers=layers, save=save, task=task, cfg=cfg, cfg_path=cfg_path, ch=ch)
+        if args_overrides:
+            for k, v in args_overrides.items():
+                setattr(instance.args, k, v)
+        if verbose:
+            print(f"Built {task} model from {cfg_path} with {sum(p.numel() for p in instance.parameters()):,} params")
+        return instance
+
+    def _predict_once(self, x: torch.Tensor):
+        y = []
+        for m in self.model:
+            if m.f != -1:
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
+            x = m(x)
+            y.append(x if m.i in self.save else None)
+        return x
+
+    def forward(self, x):
+        if isinstance(x, dict):
+            return self.loss(x)
+        return self._predict_once(x)
+
+    def loss(self, batch: dict[str, torch.Tensor], preds=None):
+        if self.criterion is None:
+            self.criterion = build_criterion(self, self.task)
+        if preds is None:
+            preds = self.forward(batch["img"])
+        return self.criterion(preds, batch)
 
     def _infer_stride(self, ch: int) -> torch.Tensor:
+        training = self.training
+        self.train()
         with torch.no_grad():
-            raw = self.forward(torch.zeros(1, ch, 256, 256))
-        strides = []
-        for feat in raw["feats"]:
-            strides.append(256 / feat.shape[-1])
-        return torch.tensor(strides, dtype=torch.float32)
+            raw = self._predict_once(torch.zeros(1, ch, 256, 256))
+        preds = raw["one2many"] if isinstance(raw, dict) and "one2many" in raw else raw
+        feats = preds["feats"]
+        stride = torch.tensor([256 / feat.shape[-2] for feat in feats], dtype=torch.float32)
+        self.train(training)
+        return stride
 
-    def save_checkpoint(self, path: str | Path, **extra: Any) -> None:
-        torch.save({"model": self.state_dict(), "task": self.task, "names": self.names, **extra}, path)
+    def decode_predictions(self, preds: dict[str, torch.Tensor]) -> torch.Tensor:
+        head = self.model[-1]
+        pred_boxes = preds["boxes"]
+        pred_scores = preds["scores"]
+        anchor_points, stride_tensor = make_anchors(preds["feats"], self.stride, 0.5)
+        if head.reg_max > 1:
+            b, _, a = pred_boxes.shape
+            pred_boxes = pred_boxes.view(b, 4, head.reg_max, a).transpose(2, 1).softmax(1)
+            proj = torch.arange(head.reg_max, dtype=pred_boxes.dtype, device=pred_boxes.device)
+            pred_boxes = pred_boxes.matmul(proj).view(b, 4, a)
+        if self.task == "obb":
+            angle = preds["angle"]
+            dbox = dist2rbox(pred_boxes.transpose(1, 2), angle.transpose(1, 2), anchor_points).transpose(1, 2)
+            return torch.cat((dbox * stride_tensor.T, pred_scores.sigmoid(), angle), 1)
+        dbox = dist2bbox(pred_boxes.transpose(1, 2), anchor_points, xywh=True).transpose(1, 2)
+        return torch.cat((dbox * stride_tensor.T, pred_scores.sigmoid()), 1)
 
-    def save(self, path: str | Path, **extra: Any) -> None:
-        self.save_checkpoint(path, **extra)
+    @torch.inference_mode()
+    def postprocess(self, raw_preds, conf: float = 0.25, iou: float = 0.7, max_det: int = 300):
+        preds = raw_preds["one2one"] if isinstance(raw_preds, dict) and "one2one" in raw_preds else raw_preds
+        decoded = self.decode_predictions(preds)
+        outputs = non_max_suppression(
+            decoded,
+            conf_thres=conf,
+            iou_thres=iou,
+            multi_label=True,
+            max_det=max_det,
+            nc=self.nc,
+            rotated=self.task == "obb",
+            end2end=self.end2end,
+        )
+        formatted = []
+        for x in outputs:
+            extra = x[:, 6:] if x.shape[1] > 6 else x[:, 6:]
+            bboxes = torch.cat((x[:, :4], extra), dim=-1) if self.task == "obb" else x[:, :4]
+            formatted.append({"bboxes": bboxes, "conf": x[:, 4], "cls": x[:, 5]})
+        return formatted
 
     def load(self, path: str | Path, strict: bool = True) -> None:
         checkpoint = torch.load(path, map_location="cpu")
@@ -85,52 +145,8 @@ class RecYOLO26Model(nn.Module):
         self.load_state_dict(state_dict, strict=strict)
         self.names = checkpoint.get("names", self.names)
 
-    def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
-        outputs = []
-        x = images
-        for module in self.model:
-            if module.f != -1:
-                x = outputs[module.f] if isinstance(module.f, int) else [x if j == -1 else outputs[j] for j in module.f]
-            if module is self.head:
-                return module.forward_head(x if isinstance(x, list) else [x])
-            x = module(x)
-            outputs.append(x)
-        raise RuntimeError("Head layer was not reached.")
+    def save_checkpoint(self, path: str | Path, **extra: Any) -> None:
+        torch.save({"model": self.state_dict(), "task": self.task, "names": self.names, **extra}, path)
 
-    def decode_outputs(self, raw_preds: dict[str, torch.Tensor]) -> list[dict[str, torch.Tensor]]:
-        feats = raw_preds["feats"]
-        boxes = raw_preds["boxes"]
-        scores = raw_preds["scores"]
-        angles = raw_preds.get("angle")
-        start = 0
-        decoded_levels = []
-        for level, feat in enumerate(feats):
-            bs, _, h, w = feat.shape
-            count = h * w
-            grid = make_grid(h, w, feat.device).unsqueeze(0)
-            stride = self.stride[level].to(feat.device)
-            level_boxes = boxes[:, :, start : start + count].permute(0, 2, 1)
-            level_scores = scores[:, :, start : start + count].permute(0, 2, 1)
-            xy = (level_boxes[..., :2].sigmoid() * 2.0 - 0.5 + grid) * stride
-            wh = (level_boxes[..., 2:4].sigmoid() * 2.0).pow(2.0) * stride
-            decoded = torch.cat((xy, wh), dim=-1)
-            level_pred = {"boxes": decoded, "scores": level_scores}
-            if angles is not None:
-                level_pred["angles"] = angles[:, :, start : start + count].permute(0, 2, 1).tanh() * (torch.pi / 2)
-            decoded_levels.append(level_pred)
-            start += count
-
-        merged = []
-        for b in range(boxes.shape[0]):
-            sample_boxes = torch.cat([x["boxes"][b] for x in decoded_levels], dim=0)
-            sample_scores = torch.cat([x["scores"][b] for x in decoded_levels], dim=0)
-            sample = {"boxes": sample_boxes, "scores": sample_scores}
-            if angles is not None:
-                sample["boxes"] = torch.cat((sample_boxes, torch.cat([x["angles"][b] for x in decoded_levels], dim=0)), dim=-1)
-            merged.append(sample)
-        return merged
-
-    @torch.inference_mode()
-    def postprocess(self, raw_preds: dict[str, torch.Tensor], conf: float = 0.25, iou: float = 0.7) -> list[dict[str, torch.Tensor]]:
-        decoded = self.decode_outputs(raw_preds)
-        return non_max_suppression(decoded, conf_thres=conf, iou_thres=iou, task=self.task)
+    def save(self, path: str | Path, **extra: Any) -> None:
+        self.save_checkpoint(path, **extra)

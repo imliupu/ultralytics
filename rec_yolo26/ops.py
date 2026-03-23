@@ -5,21 +5,24 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 import yaml
-from torchvision.ops import box_iou, nms
 
-from .modules import C2PSA, C3k2, Concat, Conv, Detect, OBB, SPPF
+from .modules import C2PSA, C3, C3k, C3k2, Concat, Conv, Detect, OBB, OBB26, SPPF
 
 MODULES = {
     "Conv": Conv,
+    "C3": C3,
+    "C3k": C3k,
     "C3k2": C3k2,
     "SPPF": SPPF,
     "C2PSA": C2PSA,
     "Concat": Concat,
     "Detect": Detect,
     "OBB": OBB,
+    "OBB26": OBB26,
     "nn.Upsample": nn.Upsample,
 }
 
@@ -38,43 +41,214 @@ def xywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
     return torch.stack((x - w / 2, y - h / 2, x + w / 2, y + h / 2), dim=-1)
 
 
+def xyxy_to_xywh(boxes: torch.Tensor) -> torch.Tensor:
+    x1, y1, x2, y2 = boxes.unbind(-1)
+    return torch.stack(((x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1), dim=-1)
+
+
+def xywhr_to_xyxyxyxy(boxes: torch.Tensor) -> torch.Tensor:
+    ctr = boxes[..., :2]
+    wh = boxes[..., 2:4] / 2
+    angle = boxes[..., 4:5]
+    cos, sin = angle.cos(), angle.sin()
+    rot = torch.stack((
+        torch.cat((cos, -sin), dim=-1),
+        torch.cat((sin, cos), dim=-1),
+    ), dim=-2)
+    corners = torch.tensor([[-1, -1], [1, -1], [1, 1], [-1, 1]], dtype=boxes.dtype, device=boxes.device)
+    corners = corners * wh.unsqueeze(-2)
+    return corners @ rot.transpose(-1, -2) + ctr.unsqueeze(-2)
+
+
 def xywhr_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
-    return xywh_to_xyxy(boxes[..., :4])
+    corners = xywhr_to_xyxyxyxy(boxes)
+    mins = corners.amin(dim=-2)
+    maxs = corners.amax(dim=-2)
+    return torch.cat((mins, maxs), dim=-1)
 
 
-def make_grid(h: int, w: int, device: torch.device) -> torch.Tensor:
-    yy, xx = torch.meshgrid(torch.arange(h, device=device), torch.arange(w, device=device), indexing="ij")
-    return torch.stack((xx, yy), dim=-1).reshape(-1, 2).float()
+def box_iou(box1: torch.Tensor, box2: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    a1, a2 = box1[:, None, :2], box1[:, None, 2:]
+    b1, b2 = box2[None, :, :2], box2[None, :, 2:]
+    inter = (torch.minimum(a2, b2) - torch.maximum(a1, b1)).clamp_(0).prod(2)
+    return inter / ((a2 - a1).prod(2) + (b2 - b1).prod(2) - inter + eps)
 
 
-def build_targets_from_batch(batch: dict[str, torch.Tensor], task: str) -> list[dict[str, torch.Tensor]]:
-    targets = []
-    batch_size = batch["img"].shape[0]
-    for i in range(batch_size):
-        idx = batch["batch_idx"] == i
-        targets.append({"cls": batch["cls"][idx].view(-1), "bboxes": batch["bboxes"][idx].view(-1, 5 if task == 'obb' else 4)})
-    return targets
+def bbox_iou(box1: torch.Tensor, box2: torch.Tensor, xywh: bool = True, CIoU: bool = False, eps: float = 1e-7):
+    if xywh:
+        box1, box2 = xywh_to_xyxy(box1), xywh_to_xyxy(box2)
+    inter = (
+        (torch.minimum(box1[..., 2:], box2[..., 2:]) - torch.maximum(box1[..., :2], box2[..., :2])).clamp(0).prod(-1)
+    )
+    area1 = (box1[..., 2] - box1[..., 0]).clamp(0) * (box1[..., 3] - box1[..., 1]).clamp(0)
+    area2 = (box2[..., 2] - box2[..., 0]).clamp(0) * (box2[..., 3] - box2[..., 1]).clamp(0)
+    union = area1 + area2 - inter + eps
+    iou = inter / union
+    if not CIoU:
+        return iou.unsqueeze(-1)
+    c_x1y1 = torch.minimum(box1[..., :2], box2[..., :2])
+    c_x2y2 = torch.maximum(box1[..., 2:], box2[..., 2:])
+    c2 = ((c_x2y2 - c_x1y1) ** 2).sum(-1) + eps
+    rho2 = ((xyxy_to_xywh(box1)[..., :2] - xyxy_to_xywh(box2)[..., :2]) ** 2).sum(-1)
+    w1, h1 = xyxy_to_xywh(box1)[..., 2:].unbind(-1)
+    w2, h2 = xyxy_to_xywh(box2)[..., 2:].unbind(-1)
+    v = (4 / math.pi**2) * (torch.atan(w2 / (h2 + eps)) - torch.atan(w1 / (h1 + eps))) ** 2
+    with torch.no_grad():
+        alpha = v / (v - iou + 1 + eps)
+    return (iou - (rho2 / c2 + v * alpha)).unsqueeze(-1)
 
 
-def non_max_suppression(predictions: list[dict[str, torch.Tensor]], conf_thres: float, iou_thres: float, task: str):
-    outputs = []
-    for pred in predictions:
-        scores = pred["scores"].sigmoid()
-        conf, cls = scores.max(dim=-1)
-        keep = conf >= conf_thres
-        if keep.sum() == 0:
-            outputs.append({"bboxes": pred["boxes"].new_zeros((0, 5 if task == 'obb' else 4)), "conf": conf[:0], "cls": cls[:0].float()})
+def _get_covariance_matrix(obb: torch.Tensor):
+    w, h, a = obb[..., 2:3], obb[..., 3:4], obb[..., 4:5]
+    cos, sin = a.cos(), a.sin()
+    a_term = (w.pow(2) * cos.pow(2) + h.pow(2) * sin.pow(2)) / 12
+    b_term = (w.pow(2) * sin.pow(2) + h.pow(2) * cos.pow(2)) / 12
+    c_term = (w.pow(2) - h.pow(2)) * sin * cos / 12
+    return a_term, b_term, c_term
+
+
+def probiou(obb1: torch.Tensor, obb2: torch.Tensor, CIoU: bool = False, eps: float = 1e-7) -> torch.Tensor:
+    x1, y1 = obb1[..., :2].split(1, dim=-1)
+    x2, y2 = obb2[..., :2].split(1, dim=-1)
+    a1, b1, c1 = _get_covariance_matrix(obb1)
+    a2, b2, c2 = _get_covariance_matrix(obb2)
+    t1 = (((a1 + a2) * (y1 - y2).pow(2) + (b1 + b2) * (x1 - x2).pow(2)) / ((a1 + a2) * (b1 + b2) - (c1 + c2).pow(2) + eps)) * 0.25
+    t2 = (((c1 + c2) * (x2 - x1) * (y1 - y2)) / ((a1 + a2) * (b1 + b2) - (c1 + c2).pow(2) + eps)) * 0.5
+    t3 = ((((a1 + a2) * (b1 + b2) - (c1 + c2).pow(2)) / (4 * ((a1 * b1 - c1.pow(2)).clamp_(0) * (a2 * b2 - c2.pow(2)).clamp_(0)).sqrt() + eps)) + eps).log() * 0.5
+    bd = (t1 + t2 + t3).clamp(eps, 100.0)
+    hd = (1.0 - (-bd).exp() + eps).sqrt()
+    iou = 1 - hd
+    if not CIoU:
+        return iou
+    w1, h1 = obb1[..., 2:4].split(1, dim=-1)
+    w2, h2 = obb2[..., 2:4].split(1, dim=-1)
+    v = (4 / math.pi**2) * ((w2 / h2).atan() - (w1 / h1).atan()).pow(2)
+    with torch.no_grad():
+        alpha = v / (v - iou + 1 + eps)
+    return iou - v * alpha
+
+
+def batch_probiou(obb1: torch.Tensor, obb2: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    x1, y1 = obb1[..., :2].split(1, dim=-1)
+    x2, y2 = (x.squeeze(-1)[None] for x in obb2[..., :2].split(1, dim=-1))
+    a1, b1, c1 = _get_covariance_matrix(obb1)
+    a2, b2, c2 = (x.squeeze(-1)[None] for x in _get_covariance_matrix(obb2))
+    t1 = (((a1 + a2) * (y1 - y2).pow(2) + (b1 + b2) * (x1 - x2).pow(2)) / ((a1 + a2) * (b1 + b2) - (c1 + c2).pow(2) + eps)) * 0.25
+    t2 = (((c1 + c2) * (x2 - x1) * (y1 - y2)) / ((a1 + a2) * (b1 + b2) - (c1 + c2).pow(2) + eps)) * 0.5
+    t3 = ((((a1 + a2) * (b1 + b2) - (c1 + c2).pow(2)) / (4 * ((a1 * b1 - c1.pow(2)).clamp_(0) * (a2 * b2 - c2.pow(2)).clamp_(0)).sqrt() + eps)) + eps).log() * 0.5
+    bd = (t1 + t2 + t3).clamp(eps, 100.0)
+    hd = (1.0 - (-bd).exp() + eps).sqrt()
+    return 1 - hd
+
+
+def make_anchors(feats: list[torch.Tensor], strides: torch.Tensor, grid_cell_offset: float = 0.5):
+    anchor_points, stride_tensor = [], []
+    dtype, device = feats[0].dtype, feats[0].device
+    for i, feat in enumerate(feats):
+        h, w = feat.shape[2:]
+        sx = torch.arange(end=w, device=device, dtype=dtype) + grid_cell_offset
+        sy = torch.arange(end=h, device=device, dtype=dtype) + grid_cell_offset
+        sy, sx = torch.meshgrid(sy, sx, indexing="ij")
+        anchor_points.append(torch.stack((sx, sy), -1).view(-1, 2))
+        stride_tensor.append(torch.full((h * w, 1), strides[i], dtype=dtype, device=device))
+    return torch.cat(anchor_points), torch.cat(stride_tensor)
+
+
+def dist2bbox(distance: torch.Tensor, anchor_points: torch.Tensor, xywh: bool = True, dim: int = -1) -> torch.Tensor:
+    lt, rb = distance.chunk(2, dim)
+    x1y1 = anchor_points - lt
+    x2y2 = anchor_points + rb
+    if xywh:
+        c_xy = (x1y1 + x2y2) / 2
+        wh = x2y2 - x1y1
+        return torch.cat((c_xy, wh), dim)
+    return torch.cat((x1y1, x2y2), dim)
+
+
+def bbox2dist(anchor_points: torch.Tensor, bbox: torch.Tensor, reg_max: int | None = None) -> torch.Tensor:
+    x1y1, x2y2 = bbox.chunk(2, -1)
+    dist = torch.cat((anchor_points - x1y1, x2y2 - anchor_points), -1)
+    return dist.clamp_(0, reg_max - 0.01) if reg_max is not None else dist
+
+
+def dist2rbox(pred_dist: torch.Tensor, pred_angle: torch.Tensor, anchor_points: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    lt, rb = pred_dist.split(2, dim=dim)
+    cos, sin = torch.cos(pred_angle), torch.sin(pred_angle)
+    xf, yf = ((rb - lt) / 2).split(1, dim=dim)
+    x, y = xf * cos - yf * sin, xf * sin + yf * cos
+    xy = torch.cat((x, y), dim=dim) + anchor_points
+    return torch.cat((xy, lt + rb), dim=dim)
+
+
+def rbox2dist(target_bboxes: torch.Tensor, anchor_points: torch.Tensor, target_angle: torch.Tensor, reg_max: int | None = None):
+    xy, wh = target_bboxes.split(2, dim=-1)
+    offset = xy - anchor_points
+    offset_x, offset_y = offset.split(1, dim=-1)
+    cos, sin = torch.cos(target_angle), torch.sin(target_angle)
+    xf = offset_x * cos + offset_y * sin
+    yf = -offset_x * sin + offset_y * cos
+    w, h = wh.split(1, dim=-1)
+    dist = torch.cat((w / 2 - xf, h / 2 - yf, w / 2 + xf, h / 2 + yf), dim=-1)
+    return dist.clamp_(0, reg_max - 0.01) if reg_max is not None else dist
+
+
+def nms_xyxy(boxes: torch.Tensor, scores: torch.Tensor, iou_thres: float) -> torch.Tensor:
+    if boxes.numel() == 0:
+        return torch.empty((0,), dtype=torch.long, device=boxes.device)
+    x1, y1, x2, y2 = boxes.unbind(1)
+    areas = (x2 - x1).clamp(0) * (y2 - y1).clamp(0)
+    order = scores.argsort(descending=True)
+    keep = []
+    while order.numel() > 0:
+        i = order[0]
+        keep.append(i)
+        if order.numel() == 1:
+            break
+        rest = order[1:]
+        xx1 = torch.maximum(x1[i], x1[rest])
+        yy1 = torch.maximum(y1[i], y1[rest])
+        xx2 = torch.minimum(x2[i], x2[rest])
+        yy2 = torch.minimum(y2[i], y2[rest])
+        inter = (xx2 - xx1).clamp(0) * (yy2 - yy1).clamp(0)
+        iou = inter / (areas[i] + areas[rest] - inter + 1e-7)
+        order = rest[iou <= iou_thres]
+    return torch.stack(keep)
+
+
+def non_max_suppression(prediction: torch.Tensor, conf_thres=0.25, iou_thres=0.45, multi_label=False, max_det=300, nc=0, rotated=False, end2end=False):
+    if isinstance(prediction, (list, tuple)):
+        prediction = prediction[0]
+    if prediction.shape[-1] == 6 or prediction.shape[-1] == 7 or end2end:
+        return [pred[pred[:, 4] > conf_thres][:max_det] for pred in prediction]
+    bs = prediction.shape[0]
+    nc = nc or (prediction.shape[1] - 4 - (1 if rotated else 0))
+    extra = prediction.shape[1] - nc - 4
+    mi = 4 + nc
+    xc = prediction[:, 4:mi].amax(1) > conf_thres
+    prediction = prediction.transpose(-1, -2)
+    if not rotated:
+        prediction[..., :4] = xywh_to_xyxy(prediction[..., :4])
+    output = [torch.zeros((0, 6 + extra), device=prediction.device)] * bs
+    for xi, x in enumerate(prediction):
+        x = x[xc[xi]]
+        if not x.shape[0]:
             continue
-        boxes = pred["boxes"][keep]
-        conf = conf[keep]
-        cls = cls[keep].float()
-        if task == "obb":
-            keep_idx = nms(xywhr_to_xyxy(boxes), conf, iou_thres)
-            outputs.append({"bboxes": boxes[keep_idx], "conf": conf[keep_idx], "cls": cls[keep_idx]})
+        box, cls, extra_info = x.split((4, nc, extra), 1)
+        if multi_label and nc > 1:
+            i, j = torch.where(cls > conf_thres)
+            x = torch.cat((box[i], x[i, 4 + j, None], j[:, None].float(), extra_info[i]), 1)
         else:
-            keep_idx = nms(xywh_to_xyxy(boxes), conf, iou_thres)
-            outputs.append({"bboxes": xywh_to_xyxy(boxes)[keep_idx], "conf": conf[keep_idx], "cls": cls[keep_idx]})
-    return outputs
+            conf, j = cls.max(1, keepdim=True)
+            x = torch.cat((box, conf, j.float(), extra_info), 1)[conf.view(-1) > conf_thres]
+        if not x.shape[0]:
+            continue
+        scores = x[:, 4]
+        if rotated:
+            keep = nms_xyxy(xywhr_to_xyxy(torch.cat((x[:, :4], x[:, -1:]), dim=-1)), scores, iou_thres)
+        else:
+            keep = nms_xyxy(x[:, :4], scores, iou_thres)
+        output[xi] = x[keep[:max_det]]
+    return output
 
 
 def build_model_from_yaml(cfg: dict[str, Any], task: str, scale: str = "n", ch: int = 3, nc: int | None = None):
@@ -82,15 +256,14 @@ def build_model_from_yaml(cfg: dict[str, Any], task: str, scale: str = "n", ch: 
     depth, width, max_channels = cfg.get("scales", {}).get(scale, cfg.get("scales", {}).get("n", [1.0, 1.0, 1024]))
     if nc is not None:
         cfg["nc"] = nc
-    layers = []
-    save = []
-    channels = [ch]
+    layers, save, channels = [], [], [ch]
+    reg_max = int(cfg.get("reg_max", 1))
+    end2end = bool(cfg.get("end2end", False))
 
     def ch_lookup(index: int) -> int:
         return channels[index + 1] if index != -1 else channels[-1]
 
-    definitions = cfg["backbone"] + cfg["head"]
-    for i, (f, n, module_name, args) in enumerate(definitions):
+    for i, (f, n, module_name, args) in enumerate(cfg["backbone"] + cfg["head"]):
         module_cls = MODULES[module_name]
         repeats = max(round(n * depth), 1) if n > 1 else n
         if module_name == "nn.Upsample":
@@ -99,9 +272,12 @@ def build_model_from_yaml(cfg: dict[str, Any], task: str, scale: str = "n", ch: 
         elif module_name == "Concat":
             module = module_cls(*args)
             c2 = sum(ch_lookup(x) for x in f)
-        elif module_name in {"Detect", "OBB"}:
-            from_channels = [ch_lookup(x) for x in f]
-            module = module_cls(cfg["nc"], args[1], tuple(from_channels)) if module_name == "OBB" else module_cls(cfg["nc"], tuple(from_channels))
+        elif module_name in {"Detect", "OBB", "OBB26"}:
+            from_channels = tuple(ch_lookup(x) for x in f)
+            if module_name == "Detect":
+                module = module_cls(cfg["nc"], reg_max, end2end, from_channels)
+            else:
+                module = module_cls(cfg["nc"], args[1], reg_max, end2end, from_channels)
             c2 = sum(from_channels)
         else:
             c1 = ch_lookup(f) if isinstance(f, int) else sum(ch_lookup(x) for x in f)
@@ -109,17 +285,21 @@ def build_model_from_yaml(cfg: dict[str, Any], task: str, scale: str = "n", ch: 
             if c2 != cfg["nc"]:
                 c2 = make_divisible(min(c2, max_channels) * width, 8)
             if module_name == "C3k2":
-                module = nn.Sequential(*[module_cls(c1 if j == 0 else c2, c2, *args[1:]) for j in range(repeats)])
+                module = module_cls(c1, c2, repeats, *args[1:])
             elif module_name == "C2PSA":
-                module = nn.Sequential(*[module_cls(c1 if j == 0 else c2, c2) for j in range(repeats)])
+                module = module_cls(c1, c2, repeats)
+            elif module_name == "SPPF":
+                module = module_cls(c1, c2, *args[1:])
             else:
                 module = module_cls(c1, c2, *args[1:])
         module.f = f
         module.i = i
+        module.type = module_name
+        module.np = sum(p.numel() for p in module.parameters())
         layers.append(module)
         channels.append(c2)
         if isinstance(f, list):
             save.extend(x for x in f if x != -1)
         elif f != -1:
             save.append(f)
-    return nn.ModuleList(layers), sorted(set(save))
+    return nn.ModuleList(layers), sorted(set(save)), cfg
