@@ -7,9 +7,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import cv2
 import numpy as np
 import torch
+from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
 from .ops import xywh_to_xyxy, yaml_load
@@ -68,18 +68,28 @@ def letterbox(image: np.ndarray, new_shape: int) -> tuple[np.ndarray, float, tup
     dw //= 2
     dh //= 2
     if shape[::-1] != new_unpad:
-        image = cv2.resize(image, new_unpad, interpolation=cv2.INTER_LINEAR)
-    image = cv2.copyMakeBorder(image, dh, new_shape - new_unpad[1] - dh, dw, new_shape - new_unpad[0] - dw, cv2.BORDER_CONSTANT, value=(114, 114, 114))
+        image = np.asarray(Image.fromarray(image).resize(new_unpad, resample=Image.Resampling.BILINEAR))
+    image = np.pad(
+        image,
+        ((dh, new_shape - new_unpad[1] - dh), (dw, new_shape - new_unpad[0] - dw), (0, 0)),
+        mode="constant",
+        constant_values=114,
+    )
     return image, ratio, (dw, dh)
 
 
 def augment_hsv(image: np.ndarray, cfg: AugmentConfig) -> np.ndarray:
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV).astype(np.float32)
+    hsv = np.asarray(Image.fromarray(image, mode="RGB").convert("HSV"), dtype=np.float32)
     gains = np.array([cfg.hsv_h, cfg.hsv_s, cfg.hsv_v]) * np.random.uniform(-1, 1, 3) + 1
     hsv[..., 0] = (hsv[..., 0] * gains[0]) % 180
     hsv[..., 1] = np.clip(hsv[..., 1] * gains[1], 0, 255)
     hsv[..., 2] = np.clip(hsv[..., 2] * gains[2], 0, 255)
-    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+    return np.asarray(Image.fromarray(hsv.astype(np.uint8), mode="HSV").convert("RGB"))
+
+
+def load_image(image_path: Path) -> np.ndarray:
+    with Image.open(image_path) as image:
+        return np.asarray(image.convert("RGB"))
 
 
 def polygon_to_xywhr(points: np.ndarray) -> np.ndarray:
@@ -148,9 +158,7 @@ class YOLO26Dataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         image_path = self.images[index]
-        image = cv2.imread(str(image_path))
-        if image is None:
-            raise FileNotFoundError(f"Failed to load image: {image_path}")
+        image = load_image(image_path)
         original_shape = image.shape[:2]
         cls, boxes = self._load_labels(self.labels[index])
         if self.augment:
@@ -182,7 +190,7 @@ class YOLO26Dataset(Dataset):
                 if self.task == "obb":
                     boxes[:, 4] *= -1
 
-        image = image[:, :, ::-1].transpose(2, 0, 1)
+        image = image.transpose(2, 0, 1)
         image = np.ascontiguousarray(image)
         return {
             "img": torch.from_numpy(image),
