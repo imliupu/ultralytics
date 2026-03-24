@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional, Union
@@ -11,13 +12,12 @@ import torch.nn as nn
 from .loss import build_criterion
 from .ops import build_model_from_yaml, dist2bbox, dist2rbox, make_anchors, non_max_suppression, yaml_load
 
-CONFIG_DIR = Path(__file__).resolve().parents[1] / "ultralytics" / "cfg" / "models" / "26"
+CONFIG_DIR = Path(__file__).resolve().parent / "configs"
 MODEL_ALIASES = {
     "yolo26": CONFIG_DIR / "yolo26.yaml",
     "yolo26-obb": CONFIG_DIR / "yolo26-obb.yaml",
     "yolo26obb": CONFIG_DIR / "yolo26-obb.yaml",
 }
-MODEL_BY_TASK = {"detect": DetectionModel, "obb": OBBModel}
 
 
 @dataclass
@@ -45,6 +45,7 @@ class RecYOLO26Model(nn.Module):
         self.criterion = None
         self.stride = self._infer_stride(ch)
         self.model[-1].stride = self.stride
+        self._init_head_biases()
 
     @staticmethod
     def resolve_model_cfg(model: str, task: str) -> Path:
@@ -59,6 +60,8 @@ class RecYOLO26Model(nn.Module):
     def build(cls, task: str, nc: int, model: str = "yolo26", scale: str = "n", ch: int = 3, verbose: bool = False, args_overrides: Optional[dict[str, Any]] = None):
         cfg_path = cls.resolve_model_cfg(model, task)
         cfg = yaml_load(cfg_path)
+        if args_overrides and "end2end" in args_overrides:
+            cfg["end2end"] = bool(args_overrides["end2end"])
         layers, save, cfg = build_model_from_yaml(cfg=cfg, task=task, scale=scale, ch=ch, nc=nc)
         instance = cls(layers=layers, save=save, task=task, cfg=cfg, cfg_path=cfg_path, ch=ch)
         if args_overrides:
@@ -110,6 +113,8 @@ class RecYOLO26Model(nn.Module):
             pred_boxes = pred_boxes.view(b, 4, head.reg_max, a).transpose(2, 1).softmax(1)
             proj = torch.arange(head.reg_max, dtype=pred_boxes.dtype, device=pred_boxes.device)
             pred_boxes = pred_boxes.matmul(proj).view(b, 4, a)
+        else:
+            pred_boxes = torch.nn.functional.softplus(pred_boxes)
         if self.task == "obb":
             angle = preds["angle"]
             dbox = dist2rbox(pred_boxes.transpose(1, 2), angle.transpose(1, 2), anchor_points).transpose(1, 2)
@@ -117,10 +122,53 @@ class RecYOLO26Model(nn.Module):
         dbox = dist2bbox(pred_boxes.transpose(1, 2), anchor_points, xywh=True).transpose(1, 2)
         return torch.cat((dbox * stride_tensor.T, pred_scores.sigmoid()), 1)
 
+    def _init_head_biases(self) -> None:
+        head = self.model[-1]
+        if not hasattr(head, "one2many"):
+            return
+
+        def init_group(group):
+            box_heads, cls_heads = group.get("box_head"), group.get("cls_head")
+            if box_heads is None or cls_heads is None:
+                return
+            for i, (a, b) in enumerate(zip(box_heads, cls_heads)):
+                if not hasattr(a[-1], "bias") or not hasattr(b[-1], "bias"):
+                    continue
+                a[-1].bias.data[:] = 2.0
+                b[-1].bias.data[: self.nc] = math.log(5 / max(self.nc, 1) / (640 / float(self.stride[i])) ** 2)
+
+        with torch.no_grad():
+            init_group(head.one2many)
+            if getattr(head, "end2end", False) and hasattr(head, "one2one"):
+                init_group(head.one2one)
+
     @torch.inference_mode()
     def postprocess(self, raw_preds, conf: float = 0.25, iou: float = 0.7, max_det: int = 300):
         preds = raw_preds["one2one"] if isinstance(raw_preds, dict) and "one2one" in raw_preds else raw_preds
         decoded = self.decode_predictions(preds)
+        if self.end2end:
+            decoded = decoded.transpose(1, 2)  # [B, N, 4 + nc (+1 for obb angle)]
+            extra_dims = 1 if self.task == "obb" else 0
+            boxes = decoded[..., :4]
+            scores = decoded[..., 4 : 4 + self.nc]
+            extra = decoded[..., 4 + self.nc : 4 + self.nc + extra_dims]
+            max_scores, cls_idx = scores.max(dim=-1)
+            topk = min(max_det, decoded.shape[1])
+            topk_scores, topk_indices = max_scores.topk(topk, dim=1)
+            gathered_boxes = boxes.gather(1, topk_indices.unsqueeze(-1).expand(-1, -1, 4))
+            gathered_cls = cls_idx.gather(1, topk_indices).float()
+            gathered_extra = extra.gather(1, topk_indices.unsqueeze(-1).expand(-1, -1, extra_dims)) if extra_dims else None
+            outputs = []
+            for bi in range(decoded.shape[0]):
+                keep = topk_scores[bi] > conf
+                b = gathered_boxes[bi][keep]
+                c = topk_scores[bi][keep]
+                k = gathered_cls[bi][keep]
+                if self.task == "obb":
+                    e = gathered_extra[bi][keep]
+                    b = torch.cat((b, e), dim=-1)
+                outputs.append({"bboxes": b, "conf": c, "cls": k})
+            return outputs
         outputs = non_max_suppression(
             decoded,
             conf_thres=conf,
