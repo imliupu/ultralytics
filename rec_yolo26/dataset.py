@@ -98,16 +98,28 @@ def list_images(path_like: Union[str, os.PathLike, list[str], tuple[str, ...]]) 
     raise FileNotFoundError(f"Unsupported image source: {path_like}")
 
 
-def letterbox(image: Image.Image, new_shape: int) -> tuple[Image.Image, float, tuple[int, int]]:
+def normalize_imgsz(imgsz: Union[int, tuple[int, int], list[int]]) -> tuple[int, int]:
+    if isinstance(imgsz, int):
+        return imgsz, imgsz
+    if isinstance(imgsz, (tuple, list)):
+        if len(imgsz) == 1:
+            return int(imgsz[0]), int(imgsz[0])
+        if len(imgsz) == 2:
+            return int(imgsz[0]), int(imgsz[1])
+    raise ValueError(f"Invalid imgsz={imgsz!r}, expected int or 2-int tuple/list.")
+
+
+def letterbox(image: Image.Image, new_shape: Union[int, tuple[int, int]]) -> tuple[Image.Image, float, tuple[int, int]]:
+    new_h, new_w = normalize_imgsz(new_shape)
     w, h = image.size
-    ratio = min(new_shape / h, new_shape / w)
+    ratio = min(new_h / h, new_w / w)
     new_unpad = (int(round(w * ratio)), int(round(h * ratio)))
-    dw, dh = new_shape - new_unpad[0], new_shape - new_unpad[1]
+    dw, dh = new_w - new_unpad[0], new_h - new_unpad[1]
     dw //= 2
     dh //= 2
     if image.size != new_unpad:
         image = image.resize(new_unpad, Image.BILINEAR)
-    canvas = Image.new("RGB", (new_shape, new_shape), (114, 114, 114))
+    canvas = Image.new("RGB", (new_w, new_h), (114, 114, 114))
     canvas.paste(image, (dw, dh))
     return canvas, ratio, (dw, dh)
 
@@ -138,7 +150,7 @@ class YOLO26Dataset(Dataset):
         self,
         image_root: Union[str, os.PathLike, list[str], tuple[str, ...]],
         task: str,
-        imgsz: int,
+        imgsz: Union[int, tuple[int, int], list[int]],
         augment: bool,
         names: dict[int, str],
         augment_cfg: Optional[AugmentConfig] = None,
@@ -147,7 +159,7 @@ class YOLO26Dataset(Dataset):
         if task not in SUPPORTED_TASKS:
             raise NotImplementedError(f"Only {sorted(SUPPORTED_TASKS)} are supported, but got '{task}'.")
         self.task = task
-        self.imgsz = imgsz
+        self.imgsz = normalize_imgsz(imgsz)
         self.augment = augment
         self.names = names
         self.augment_cfg = augment_cfg or AugmentConfig()
@@ -206,7 +218,7 @@ class YOLO26Dataset(Dataset):
             boxes[:, 1] = boxes[:, 1] * original_shape[0] * ratio + pad[1]
             boxes[:, 2] = boxes[:, 2] * original_shape[1] * ratio
             boxes[:, 3] = boxes[:, 3] * original_shape[0] * ratio
-            boxes[:, :4] /= np.array([self.imgsz, self.imgsz, self.imgsz, self.imgsz], dtype=np.float32)
+            boxes[:, :4] /= np.array([self.imgsz[1], self.imgsz[0], self.imgsz[1], self.imgsz[0]], dtype=np.float32)
         if self.augment and random.random() < self.augment_cfg.fliplr:
             image = ImageOps.mirror(image)
             if boxes.shape[0]:
@@ -244,7 +256,7 @@ class YOLO26Dataset(Dataset):
         }
 
 
-def build_dataset(data: dict[str, Any], split: str, task: str, imgsz: int, augment: bool):
+def build_dataset(data: dict[str, Any], split: str, task: str, imgsz: Union[int, tuple[int, int], list[int]], augment: bool):
     return YOLO26Dataset(data[split], task=task, imgsz=imgsz, augment=augment, names=data["names"], obb_format=data.get("obb_format", "xywhr"))
 
 
@@ -256,7 +268,7 @@ def build_dataloader(dataset: YOLO26Dataset, batch_size: int, workers: int, shuf
 def create_train_val_dataloaders(
     data_yaml: Union[str, os.PathLike],
     task: str,
-    imgsz: int,
+    imgsz: Union[int, tuple[int, int], list[int]],
     batch_size: int,
     workers: int,
     eval_split: str = "val",

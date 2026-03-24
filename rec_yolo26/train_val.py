@@ -44,6 +44,14 @@ def set_seed(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
 
 
+def parse_imgsz(values: list[int]) -> tuple[int, int]:
+    if len(values) == 1:
+        return values[0], values[0]
+    if len(values) == 2:
+        return values[0], values[1]
+    raise ValueError(f"--imgsz expects one int or two ints, got: {values}")
+
+
 def move_batch_to_device(batch: dict, device: torch.device) -> dict:
     for key, value in batch.items():
         if isinstance(value, torch.Tensor):
@@ -77,13 +85,14 @@ def train_one_epoch(model, dataloader, optimizer, device, epoch: int, epochs: in
 def main(args):
     set_seed(args.seed)
     device = torch.device(args.device)
+    imgsz = parse_imgsz(args.imgsz)
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     model = RecYOLO26Model.build(task=args.task, nc=1, model=args.model, verbose=not args.quiet)
     data, train_loader, val_loader = create_train_val_dataloaders(
         args.data,
         args.task,
-        args.imgsz,
+        imgsz,
         args.batch,
         args.workers,
         stride=int(max(model.stride.max().item(), 32)),
@@ -128,7 +137,7 @@ def build_parser():
     parser.add_argument("--model", default="yolo26")
     parser.add_argument("--data", required=True)
     parser.add_argument("--weights", default=None)
-    parser.add_argument("--imgsz", type=int, default=640)
+    parser.add_argument("--imgsz", type=int, nargs="+", default=[640], help="Image size as single int or 'h w'.")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--workers", type=int, default=4)
