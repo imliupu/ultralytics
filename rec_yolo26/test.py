@@ -23,7 +23,7 @@ def main(args):
     imgsz = parse_imgsz(args.imgsz)
     data = load_data_config(args.data)
     model = RecYOLO26Model.build(task=args.task, nc=data["nc"], model=args.model, verbose=not args.quiet)
-    model.load(args.weights, strict=False)
+    model.load(args.weights)
     model.to(device)
     model.names = data["names"]
     _, _, dataloader = create_train_val_dataloaders(args.data, args.task, imgsz, args.batch, args.workers, eval_split=args.split)

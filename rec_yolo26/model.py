@@ -191,7 +191,7 @@ class RecYOLO26Model(nn.Module):
         state_dict = checkpoint.get("model", checkpoint)
         if hasattr(state_dict, "state_dict"):
             state_dict = state_dict.state_dict()
-        self.model.load_state_dict(state_dict, strict=strict)
+        self.load_state_dict(state_dict, strict=strict)
         self.names = checkpoint.get("names", self.names)
         self.model.names = self.names
 

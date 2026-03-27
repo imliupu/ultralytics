@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import random
 from pathlib import Path
 
@@ -53,42 +54,6 @@ def parse_imgsz(values: list[int]) -> tuple[int, int]:
     raise ValueError(f"--imgsz expects one int or two ints, got: {values}")
 
 
-class ModelEMA:
-    def __init__(self, model: torch.nn.Module, decay: float = 0.9999):
-        self.ema = copy.deepcopy(model).eval()
-        self.decay = decay
-        for p in self.ema.parameters():
-            p.requires_grad_(False)
-
-    @torch.no_grad()
-    def update(self, model: torch.nn.Module) -> None:
-        msd = model.state_dict()
-        for k, v in self.ema.state_dict().items():
-            src = msd[k].detach()
-            if v.dtype.is_floating_point:
-                v.mul_(self.decay).add_(src, alpha=1.0 - self.decay)
-            else:
-                v.copy_(src)
-
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
-def parse_imgsz(values: list[int]) -> tuple[int, int]:
-    if len(values) == 1:
-        return values[0], values[0]
-    if len(values) == 2:
-        return values[0], values[1]
-    raise ValueError(f"--imgsz expects one int or two ints, got: {values}")
-
-
 def move_batch_to_device(batch: dict, device: torch.device) -> dict:
     for key, value in batch.items():
         if isinstance(value, torch.Tensor):
@@ -97,21 +62,49 @@ def move_batch_to_device(batch: dict, device: torch.device) -> dict:
     return batch
 
 
-def train_one_epoch(model, dataloader, optimizer, device, epoch: int, epochs: int, grad_clip: float = 10.0, ema: ModelEMA | None = None):
+def train_one_epoch(
+    model,
+    dataloader,
+    optimizer,
+    device,
+    epoch: int,
+    epochs: int,
+    grad_clip: float = 10.0,
+    ema: ModelEMA | None = None,
+    base_accumulate: int = 1,
+    warmup_steps: int = -1,
+    warmup_bias_lr: float = 0.1,
+    warmup_momentum: float = 0.8,
+    final_momentum: float = 0.9,
+):
     model.train()
     running_loss = 0.0
+    nb = max(len(dataloader), 1)
+    last_opt_step = -1
+    optimizer.zero_grad(set_to_none=True)
     progress = tqdm(dataloader, desc=f"train {epoch + 1}/{epochs}")
     for step, batch in enumerate(progress, start=1):
+        ni = (step - 1) + nb * epoch
+        accumulate = base_accumulate
+        if warmup_steps >= 0 and ni <= warmup_steps:
+            xi = [0, warmup_steps]
+            accumulate = max(1, int(np.interp(ni, xi, [1, base_accumulate]).round()))
+            for pg in optimizer.param_groups:
+                pg["lr"] = float(np.interp(ni, xi, [warmup_bias_lr if pg.get("param_group") == "bias" else 0.0, pg["initial_lr"]]))
+                if "momentum" in pg:
+                    pg["momentum"] = float(np.interp(ni, xi, [warmup_momentum, final_momentum]))
         batch = move_batch_to_device(batch, device)
-        optimizer.zero_grad(set_to_none=True)
         total_loss, _ = model.loss(batch)
         total_loss = total_loss.sum()
         total_loss.backward()
-        if grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
-        optimizer.step()
-        if ema is not None:
-            ema.update(model)
+        if ni - last_opt_step >= accumulate:
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            if ema is not None:
+                ema.update(model)
+            last_opt_step = ni
         if model.criterion is not None and hasattr(model.criterion, "update"):
             model.criterion.update()
         running_loss += float(total_loss.detach().item())
@@ -143,24 +136,45 @@ def main(args):
         args_overrides={"epochs": args.epochs, "end2end": args.end2end},
     )
     if args.weights:
-        model.load(args.weights, strict=False)
+        model.load(args.weights)
     model.to(device)
     model.names = data["names"]
     ema = ModelEMA(model, decay=args.ema_decay) if args.ema else None
     if ema is not None:
         ema.ema.names = data["names"]
+    nbs = max(args.nbs, 1)
+    accumulate = max(round(nbs / max(args.batch, 1)), 1)
+    scaled_weight_decay = args.weight_decay * args.batch * accumulate / nbs
+    iterations = math.ceil(len(train_loader.dataset) / max(args.batch, nbs)) * args.epochs
     optimizer = build_optimizer(
         model=model,
         name=args.optimizer,
         lr=args.lr0,
         momentum=args.momentum,
-        decay=args.weight_decay,
-        iterations=max(len(train_loader) * args.epochs, 1),
+        decay=scaled_weight_decay,
+        iterations=max(iterations, 1),
     )
+    for pg in optimizer.param_groups:
+        pg.setdefault("initial_lr", pg["lr"])
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1), eta_min=args.lr0 * 0.01)
     best_fitness, history = float("-inf"), []
+    nw = max(round(args.warmup_epochs * len(train_loader)), 100) if args.warmup_epochs > 0 else -1
     for epoch in range(args.epochs):
-        train_loss = train_one_epoch(model, train_loader, optimizer, device, epoch, args.epochs, grad_clip=args.grad_clip, ema=ema)
+        train_loss = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            device,
+            epoch,
+            args.epochs,
+            grad_clip=args.grad_clip,
+            ema=ema,
+            base_accumulate=accumulate,
+            warmup_steps=nw,
+            warmup_bias_lr=args.warmup_bias_lr,
+            warmup_momentum=args.warmup_momentum,
+            final_momentum=args.momentum,
+        )
         eval_model = ema.ema if ema is not None else model
         val_metrics = evaluate_model(eval_model, val_loader, device, args.task, data["names"], EvalConfig(conf=args.conf, iou=args.iou, max_det=args.max_det))
         scheduler.step()
@@ -190,6 +204,10 @@ def build_parser():
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--optimizer", default="MuSGD")
     parser.add_argument("--weight_decay", type=float, default=5e-4)
+    parser.add_argument("--nbs", type=int, default=64, help="Nominal batch size for optimizer hyperparameter scaling.")
+    parser.add_argument("--warmup_epochs", type=float, default=3.0)
+    parser.add_argument("--warmup_momentum", type=float, default=0.8)
+    parser.add_argument("--warmup_bias_lr", type=float, default=0.1)
     parser.add_argument("--grad_clip", type=float, default=10.0, help="Max gradient norm clipping value. Set <=0 to disable.")
     parser.add_argument("--conf", type=float, default=0.001)
     parser.add_argument("--iou", type=float, default=0.7)

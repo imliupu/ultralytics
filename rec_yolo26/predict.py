@@ -50,7 +50,7 @@ def main(args):
     device = torch.device(args.device)
 
     model = RecYOLO26Model.build(task=args.task, nc=nc, model=args.model, verbose=not args.quiet)
-    model.load(args.weights, strict=False)
+    model.load(args.weights)
     model.to(device).eval()
     model.names = names
 
