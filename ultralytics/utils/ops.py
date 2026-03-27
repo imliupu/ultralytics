@@ -344,6 +344,11 @@ def xyxyxyxy2xywhr(x):
     Returns:
         (np.ndarray | torch.Tensor): Converted data in [cx, cy, w, h, rotation] format with shape (N, 5). Rotation
             values are in radians from [-pi/4, 3pi/4).
+
+    Notes:
+        This conversion uses ``cv2.minAreaRect`` and therefore represents the minimum-area enclosing rotated rectangle.
+        For non-rectangular 4-point polygons (e.g. generic quadrilaterals/parallelograms), the conversion is a projection
+        to an OBB parameterization and cannot be losslessly inverted back to the original polygon coordinates.
     """
     is_torch = isinstance(x, torch.Tensor)
     points = x.cpu().numpy() if is_torch else x
