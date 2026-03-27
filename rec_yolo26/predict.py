@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import math
 from pathlib import Path
 from typing import Optional
 
@@ -11,6 +10,7 @@ from PIL import Image, ImageDraw
 
 from rec_yolo26.dataset import letterbox, load_data_config, normalize_imgsz
 from rec_yolo26.model import RecYOLO26Model
+from rec_yolo26.ops import xywhr_to_xyxyxyxy
 
 
 def parse_imgsz(values: list[int]) -> tuple[int, int]:
@@ -34,13 +34,6 @@ def infer_nc_and_names(weights: str, data_yaml: Optional[str]) -> tuple[int, dic
         norm = {i: str(v) for i, v in enumerate(names)}
         return len(norm), norm
     return 1, {0: "0"}
-
-
-def xywha_to_polygon(x: float, y: float, w: float, h: float, a: float):
-    ca, sa = math.cos(a), math.sin(a)
-    dx, dy = w / 2.0, h / 2.0
-    corners = [(-dx, -dy), (dx, -dy), (dx, dy), (-dx, dy)]
-    return [(x + px * ca - py * sa, y + px * sa + py * ca) for px, py in corners]
 
 
 @torch.inference_mode()
@@ -69,9 +62,11 @@ def main(args):
         cls_i = int(cls.item())
         label = f"{names.get(cls_i, str(cls_i))} {float(conf):.3f}"
         if args.task == "obb" and box.numel() >= 5:
-            x, y, w, h, a = [float(v) for v in box[:5]]
-            x, y, w, h = (x - padw) / ratio, (y - padh) / ratio, w / ratio, h / ratio
-            poly = xywha_to_polygon(x, y, w, h, a)
+            obb = box[:5].detach().clone().view(1, 5)
+            obb[:, 0] = (obb[:, 0] - padw) / ratio
+            obb[:, 1] = (obb[:, 1] - padh) / ratio
+            obb[:, 2:4] = obb[:, 2:4] / ratio
+            poly = xywhr_to_xyxyxyxy(obb)[0].cpu().numpy().tolist()
             draw.polygon(poly, outline="red", width=2)
             draw.text((poly[0][0], poly[0][1]), label, fill="red")
         else:

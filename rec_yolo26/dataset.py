@@ -134,14 +134,30 @@ def augment_hsv(image: Image.Image, cfg: AugmentConfig) -> Image.Image:
 
 
 def polygon_to_xywhr(points: np.ndarray) -> np.ndarray:
-    edges = np.roll(points, -1, axis=0) - points
-    lengths = np.linalg.norm(edges, axis=1)
-    long_edge = int(lengths.argmax())
-    short_edge = (long_edge + 1) % 4
-    cx, cy = points.mean(axis=0)
-    w = lengths[long_edge]
-    h = lengths[short_edge]
-    angle = _normalize_angle(np.arctan2(edges[long_edge, 1], edges[long_edge, 0]))
+    points = np.asarray(points, dtype=np.float32).reshape(4, 2)
+    try:
+        import cv2
+
+        # Align with upstream Ultralytics behavior: use OpenCV minAreaRect to obtain the minimum-area OBB.
+        (cx, cy), (w, h), angle = cv2.minAreaRect(points)
+        angle = angle / 180.0 * np.pi
+        if w < h:
+            w, h = h, w
+            angle += np.pi / 2
+        angle = _normalize_angle(angle)
+    except Exception:
+        # Fallback for environments without OpenCV: infer from polygon edges.
+        center = points.mean(axis=0, keepdims=True)
+        order = np.argsort(np.arctan2(points[:, 1] - center[0, 1], points[:, 0] - center[0, 0]))
+        points = points[order]
+        edges = np.roll(points, -1, axis=0) - points
+        lengths = np.linalg.norm(edges, axis=1)
+        long_edge = int(lengths.argmax())
+        short_edge = (long_edge + 1) % 4
+        cx, cy = points.mean(axis=0)
+        w = lengths[long_edge]
+        h = lengths[short_edge]
+        angle = _normalize_angle(np.arctan2(edges[long_edge, 1], edges[long_edge, 0]))
     return np.array([cx, cy, w, h, angle], dtype=np.float32)
 
 
@@ -179,7 +195,7 @@ class YOLO26Dataset(Dataset):
     def __len__(self) -> int:
         return len(self.images)
 
-    def _load_labels(self, label_path: Path):
+    def _load_labels(self, label_path: Path, image_hw: Optional[tuple[int, int]] = None):
         cols = 5 if self.task == "detect" else 6
         if not label_path.exists():
             return np.zeros((0, 1), dtype=np.float32), np.zeros((0, cols - 1), dtype=np.float32)
@@ -199,7 +215,16 @@ class YOLO26Dataset(Dataset):
                     boxes = boxes.copy()
                     boxes[:, 4] = np.array([_normalize_angle(a) for a in boxes[:, 4]], dtype=np.float32)
             elif arr.shape[1] == 9:
-                boxes = np.stack([polygon_to_xywhr(x.reshape(4, 2)) for x in arr[:, 1:9]], axis=0)
+                polygons = arr[:, 1:9].reshape(-1, 4, 2).copy()
+                if image_hw is not None:
+                    h, w = image_hw
+                    polygons[..., 0] *= w
+                    polygons[..., 1] *= h
+                boxes = np.stack([polygon_to_xywhr(poly) for poly in polygons], axis=0)
+                if image_hw is not None:
+                    h, w = image_hw
+                    boxes[:, [0, 2]] /= w
+                    boxes[:, [1, 3]] /= h
             else:
                 raise ValueError(f"Unsupported OBB label format in {label_path}: expected 6 or 9 columns, got {arr.shape[1]}")
         return cls, boxes
@@ -208,7 +233,7 @@ class YOLO26Dataset(Dataset):
         image_path = self.images[index]
         image = Image.open(image_path).convert("RGB")
         original_shape = image.size[1], image.size[0]
-        cls, boxes = self._load_labels(self.labels[index])
+        cls, boxes = self._load_labels(self.labels[index], image_hw=original_shape)
         if self.augment:
             image = augment_hsv(image, self.augment_cfg)
         image, ratio, pad = letterbox(image, self.imgsz)
