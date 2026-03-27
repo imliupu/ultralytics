@@ -14,6 +14,43 @@ from tqdm import tqdm
 from rec_yolo26.dataset import create_train_val_dataloaders
 from rec_yolo26.metrics import EvalConfig, evaluate_model
 from rec_yolo26.model import RecYOLO26Model
+from rec_yolo26.optimizer import build_optimizer
+
+
+class ModelEMA:
+    def __init__(self, model: torch.nn.Module, decay: float = 0.9999):
+        self.ema = copy.deepcopy(model).eval()
+        self.decay = decay
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        msd = model.state_dict()
+        for k, v in self.ema.state_dict().items():
+            src = msd[k].detach()
+            if v.dtype.is_floating_point:
+                v.mul_(self.decay).add_(src, alpha=1.0 - self.decay)
+            else:
+                v.copy_(src)
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def parse_imgsz(values: list[int]) -> tuple[int, int]:
+    if len(values) == 1:
+        return values[0], values[0]
+    if len(values) == 2:
+        return values[0], values[1]
+    raise ValueError(f"--imgsz expects one int or two ints, got: {values}")
 
 
 class ModelEMA:
@@ -112,7 +149,14 @@ def main(args):
     ema = ModelEMA(model, decay=args.ema_decay) if args.ema else None
     if ema is not None:
         ema.ema.names = data["names"]
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr0, weight_decay=args.weight_decay)
+    optimizer = build_optimizer(
+        model=model,
+        name=args.optimizer,
+        lr=args.lr0,
+        momentum=args.momentum,
+        decay=args.weight_decay,
+        iterations=max(len(train_loader) * args.epochs, 1),
+    )
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1), eta_min=args.lr0 * 0.01)
     best_fitness, history = float("-inf"), []
     for epoch in range(args.epochs):
@@ -143,6 +187,8 @@ def build_parser():
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--lr0", type=float, default=0.01)
+    parser.add_argument("--momentum", type=float, default=0.9)
+    parser.add_argument("--optimizer", default="MuSGD")
     parser.add_argument("--weight_decay", type=float, default=5e-4)
     parser.add_argument("--grad_clip", type=float, default=10.0, help="Max gradient norm clipping value. Set <=0 to disable.")
     parser.add_argument("--conf", type=float, default=0.001)
