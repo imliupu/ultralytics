@@ -4,8 +4,6 @@ import math
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Optional, Union
-
-import numpy as np
 import torch
 import torch.nn as nn
 import yaml
@@ -215,6 +213,22 @@ def nms_xyxy(boxes: torch.Tensor, scores: torch.Tensor, iou_thres: float) -> tor
     return torch.stack(keep)
 
 
+def nms_rotated(boxes: torch.Tensor, scores: torch.Tensor, iou_thres: float) -> torch.Tensor:
+    if boxes.numel() == 0:
+        return torch.empty((0,), dtype=torch.long, device=boxes.device)
+    order = scores.argsort(descending=True)
+    keep = []
+    while order.numel() > 0:
+        i = order[0]
+        keep.append(i)
+        if order.numel() == 1:
+            break
+        rest = order[1:]
+        iou = batch_probiou(boxes[i : i + 1], boxes[rest]).squeeze(0)
+        order = rest[iou <= iou_thres]
+    return torch.stack(keep)
+
+
 def non_max_suppression(prediction: torch.Tensor, conf_thres=0.25, iou_thres=0.45, multi_label=False, max_det=300, nc=0, rotated=False, end2end=False):
     if isinstance(prediction, (list, tuple)):
         prediction = prediction[0]
@@ -244,7 +258,7 @@ def non_max_suppression(prediction: torch.Tensor, conf_thres=0.25, iou_thres=0.4
             continue
         scores = x[:, 4]
         if rotated:
-            keep = nms_xyxy(xywhr_to_xyxy(torch.cat((x[:, :4], x[:, -1:]), dim=-1)), scores, iou_thres)
+            keep = nms_rotated(torch.cat((x[:, :4], x[:, -1:]), dim=-1), scores, iou_thres)
         else:
             keep = nms_xyxy(x[:, :4], scores, iou_thres)
         output[xi] = x[keep[:max_det]]

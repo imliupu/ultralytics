@@ -14,16 +14,47 @@ from torch.utils.data import DataLoader, Dataset
 from .ops import yaml_load
 
 SUPPORTED_TASKS = frozenset({"detect", "obb"})
+IMG_FORMATS = {".bmp", ".dng", ".jpeg", ".jpg", ".mpo", ".png", ".tif", ".tiff", ".webp", ".pfm", ".heic"}
 
 
-def load_data_config(data_yaml: str | os.PathLike[str]) -> dict[str, Any]:
-    """Load data YAML with the original Ultralytics dataset checker."""
-    return check_det_dataset(str(data_yaml), autodownload=False)
+@dataclass
+class AugmentConfig:
+    hsv_h: float = 0.015
+    hsv_s: float = 0.7
+    hsv_v: float = 0.4
+    fliplr: float = 0.5
+    flipud: float = 0.0
+
+
+def _normalize_angle(angle: float) -> float:
+    while angle >= 3 * np.pi / 4:
+        angle -= np.pi
+    while angle < -np.pi / 4:
+        angle += np.pi
+    return float(angle)
+
+
+def xyxyr_to_xywhr(boxes: np.ndarray) -> np.ndarray:
+    x1, y1, x2, y2, angle = boxes.T
+    cx = (x1 + x2) / 2
+    cy = (y1 + y2) / 2
+    w = np.abs(x2 - x1)
+    h = np.abs(y2 - y1)
+    angles = np.array([_normalize_angle(a) for a in angle], dtype=np.float32)
+    return np.stack((cx, cy, w, h, angles), axis=1).astype(np.float32)
 
 
 def load_data_config(data_yaml: Union[str, os.PathLike]) -> dict[str, Any]:
     path = Path(data_yaml).resolve()
     data = yaml_load(path)
+    if "val" not in data and "validation" in data:
+        data["val"] = data.pop("validation")
+    if "train" not in data or "val" not in data:
+        raise SyntaxError(f"{path} must define both 'train' and 'val' splits.")
+    if "names" not in data and "nc" not in data:
+        raise SyntaxError(f"{path} must define either 'names' or 'nc'.")
+    if "names" not in data:
+        data["names"] = [f"class_{i}" for i in range(int(data["nc"]))]
     root = Path(data.get("path", path.parent))
     if not root.is_absolute():
         root = (path.parent / root).resolve()
@@ -32,18 +63,31 @@ def load_data_config(data_yaml: Union[str, os.PathLike]) -> dict[str, Any]:
         value = data.get(split)
         if value is None:
             continue
-        split_path = Path(value)
-        data[split] = str((root / split_path).resolve()) if not split_path.is_absolute() else str(split_path.resolve())
+        if isinstance(value, (list, tuple)):
+            resolved = []
+            for item in value:
+                split_path = Path(item)
+                resolved.append(str((root / split_path).resolve()) if not split_path.is_absolute() else str(split_path.resolve()))
+            data[split] = resolved
+        else:
+            split_path = Path(value)
+            data[split] = str((root / split_path).resolve()) if not split_path.is_absolute() else str(split_path.resolve())
     names = data.get("names", {})
     if isinstance(names, list):
         names = {i: name for i, name in enumerate(names)}
     data["names"] = names
     data["nc"] = len(names)
     data.setdefault("channels", 3)
+    data.setdefault("obb_format", "xywhr")
     return data
 
 
-def list_images(path_like: str) -> list[Path]:
+def list_images(path_like: Union[str, os.PathLike, list[str], tuple[str, ...]]) -> list[Path]:
+    if isinstance(path_like, (list, tuple)):
+        images = []
+        for item in path_like:
+            images.extend(list_images(item))
+        return sorted(images)
     path = Path(path_like)
     if path.is_file() and path.suffix == ".txt":
         return [Path(x.strip()) for x in path.read_text().splitlines() if x.strip()]
@@ -54,16 +98,28 @@ def list_images(path_like: str) -> list[Path]:
     raise FileNotFoundError(f"Unsupported image source: {path_like}")
 
 
-def letterbox(image: Image.Image, new_shape: int) -> tuple[Image.Image, float, tuple[int, int]]:
+def normalize_imgsz(imgsz: Union[int, tuple[int, int], list[int]]) -> tuple[int, int]:
+    if isinstance(imgsz, int):
+        return imgsz, imgsz
+    if isinstance(imgsz, (tuple, list)):
+        if len(imgsz) == 1:
+            return int(imgsz[0]), int(imgsz[0])
+        if len(imgsz) == 2:
+            return int(imgsz[0]), int(imgsz[1])
+    raise ValueError(f"Invalid imgsz={imgsz!r}, expected int or 2-int tuple/list.")
+
+
+def letterbox(image: Image.Image, new_shape: Union[int, tuple[int, int]]) -> tuple[Image.Image, float, tuple[int, int]]:
+    new_h, new_w = normalize_imgsz(new_shape)
     w, h = image.size
-    ratio = min(new_shape / h, new_shape / w)
+    ratio = min(new_h / h, new_w / w)
     new_unpad = (int(round(w * ratio)), int(round(h * ratio)))
-    dw, dh = new_shape - new_unpad[0], new_shape - new_unpad[1]
+    dw, dh = new_w - new_unpad[0], new_h - new_unpad[1]
     dw //= 2
     dh //= 2
     if image.size != new_unpad:
         image = image.resize(new_unpad, Image.BILINEAR)
-    canvas = Image.new("RGB", (new_shape, new_shape), (114, 114, 114))
+    canvas = Image.new("RGB", (new_w, new_h), (114, 114, 114))
     canvas.paste(image, (dw, dh))
     return canvas, ratio, (dw, dh)
 
@@ -78,23 +134,38 @@ def augment_hsv(image: Image.Image, cfg: AugmentConfig) -> Image.Image:
 
 
 def polygon_to_xywhr(points: np.ndarray) -> np.ndarray:
-    xs, ys = points[:, 0], points[:, 1]
-    cx, cy = xs.mean(), ys.mean()
-    w = np.linalg.norm(points[1] - points[0])
-    h = np.linalg.norm(points[2] - points[1])
-    angle = np.arctan2(points[1, 1] - points[0, 1], points[1, 0] - points[0, 0])
+    edges = np.roll(points, -1, axis=0) - points
+    lengths = np.linalg.norm(edges, axis=1)
+    long_edge = int(lengths.argmax())
+    short_edge = (long_edge + 1) % 4
+    cx, cy = points.mean(axis=0)
+    w = lengths[long_edge]
+    h = lengths[short_edge]
+    angle = _normalize_angle(np.arctan2(edges[long_edge, 1], edges[long_edge, 0]))
     return np.array([cx, cy, w, h, angle], dtype=np.float32)
 
 
 class YOLO26Dataset(Dataset):
-    def __init__(self, image_root: str, task: str, imgsz: int, augment: bool, names: dict[int, str], augment_cfg: Optional[AugmentConfig] = None):
+    def __init__(
+        self,
+        image_root: Union[str, os.PathLike, list[str], tuple[str, ...]],
+        task: str,
+        imgsz: Union[int, tuple[int, int], list[int]],
+        augment: bool,
+        names: dict[int, str],
+        augment_cfg: Optional[AugmentConfig] = None,
+        obb_format: str = "xywhr",
+    ):
         if task not in SUPPORTED_TASKS:
             raise NotImplementedError(f"Only {sorted(SUPPORTED_TASKS)} are supported, but got '{task}'.")
         self.task = task
-        self.imgsz = imgsz
+        self.imgsz = normalize_imgsz(imgsz)
         self.augment = augment
         self.names = names
         self.augment_cfg = augment_cfg or AugmentConfig()
+        self.obb_format = obb_format.lower()
+        if self.task == "obb" and self.obb_format not in {"xywhr", "xyxyr"}:
+            raise ValueError(f"Unsupported obb_format='{obb_format}', expected one of ('xywhr', 'xyxyr').")
         self.images = list_images(image_root)
         self.labels = [self._label_path(path) for path in self.images]
 
@@ -122,6 +193,11 @@ class YOLO26Dataset(Dataset):
         else:
             if arr.shape[1] == 6:
                 boxes = arr[:, 1:6]
+                if self.obb_format == "xyxyr":
+                    boxes = xyxyr_to_xywhr(boxes)
+                else:
+                    boxes = boxes.copy()
+                    boxes[:, 4] = np.array([_normalize_angle(a) for a in boxes[:, 4]], dtype=np.float32)
             elif arr.shape[1] == 9:
                 boxes = np.stack([polygon_to_xywhr(x.reshape(4, 2)) for x in arr[:, 1:9]], axis=0)
             else:
@@ -142,7 +218,7 @@ class YOLO26Dataset(Dataset):
             boxes[:, 1] = boxes[:, 1] * original_shape[0] * ratio + pad[1]
             boxes[:, 2] = boxes[:, 2] * original_shape[1] * ratio
             boxes[:, 3] = boxes[:, 3] * original_shape[0] * ratio
-            boxes[:, :4] /= np.array([self.imgsz, self.imgsz, self.imgsz, self.imgsz], dtype=np.float32)
+            boxes[:, :4] /= np.array([self.imgsz[1], self.imgsz[0], self.imgsz[1], self.imgsz[0]], dtype=np.float32)
         if self.augment and random.random() < self.augment_cfg.fliplr:
             image = ImageOps.mirror(image)
             if boxes.shape[0]:
@@ -180,37 +256,30 @@ class YOLO26Dataset(Dataset):
         }
 
 
-def build_dataset(data: dict[str, Any], split: str, task: str, imgsz: int, augment: bool):
-    return YOLO26Dataset(data[split], task=task, imgsz=imgsz, augment=augment, names=data["names"])
+def build_dataset(data: dict[str, Any], split: str, task: str, imgsz: Union[int, tuple[int, int], list[int]], augment: bool):
+    return YOLO26Dataset(data[split], task=task, imgsz=imgsz, augment=augment, names=data["names"], obb_format=data.get("obb_format", "xywhr"))
 
 
 def build_dataloader(dataset: YOLO26Dataset, batch_size: int, workers: int, shuffle: bool):
+    batch_size = min(batch_size, max(len(dataset), 1))
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=workers, pin_memory=True, collate_fn=dataset.collate_fn)
 
 
-def create_train_val_dataloaders(data_yaml: Union[str, os.PathLike], task: str, imgsz: int, batch_size: int, workers: int, eval_split: str = "val", stride: int = 32):
+def create_train_val_dataloaders(
+    data_yaml: Union[str, os.PathLike],
+    task: str,
+    imgsz: Union[int, tuple[int, int], list[int]],
+    batch_size: int,
+    workers: int,
+    eval_split: str = "val",
+    stride: int = 32,
+    train_augment: bool = True,
+):
+    del stride  # retained for API compatibility with the original entrypoints
     data = load_data_config(data_yaml)
-    train_dataset = build_dataset(
-        data,
-        "train",
-        task,
-        imgsz,
-        augment=True,
-        batch_size=batch_size,
-        stride=stride,
-        args_overrides={"workers": workers, **(args_overrides or {})},
-    )
+    train_dataset = build_dataset(data, "train", task, imgsz, augment=train_augment)
     split = eval_split if eval_split in data and data.get(eval_split) else "val"
-    eval_dataset = build_dataset(
-        data,
-        split,
-        task,
-        imgsz,
-        augment=False,
-        batch_size=batch_size,
-        stride=stride,
-        args_overrides={"workers": workers, **(args_overrides or {})},
-    )
-    train_loader = build_dataloader(train_dataset, batch=batch_size, workers=workers, shuffle=True, rank=-1)
-    eval_loader = build_dataloader(eval_dataset, batch=batch_size, workers=workers, shuffle=False, rank=-1)
+    eval_dataset = build_dataset(data, split, task, imgsz, augment=False)
+    train_loader = build_dataloader(train_dataset, batch_size=batch_size, workers=workers, shuffle=True)
+    eval_loader = build_dataloader(eval_dataset, batch_size=batch_size, workers=workers, shuffle=False)
     return data, train_loader, eval_loader
