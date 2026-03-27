@@ -53,6 +53,42 @@ def parse_imgsz(values: list[int]) -> tuple[int, int]:
     raise ValueError(f"--imgsz expects one int or two ints, got: {values}")
 
 
+class ModelEMA:
+    def __init__(self, model: torch.nn.Module, decay: float = 0.9999):
+        self.ema = copy.deepcopy(model).eval()
+        self.decay = decay
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        msd = model.state_dict()
+        for k, v in self.ema.state_dict().items():
+            src = msd[k].detach()
+            if v.dtype.is_floating_point:
+                v.mul_(self.decay).add_(src, alpha=1.0 - self.decay)
+            else:
+                v.copy_(src)
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def parse_imgsz(values: list[int]) -> tuple[int, int]:
+    if len(values) == 1:
+        return values[0], values[0]
+    if len(values) == 2:
+        return values[0], values[1]
+    raise ValueError(f"--imgsz expects one int or two ints, got: {values}")
+
+
 def move_batch_to_device(batch: dict, device: torch.device) -> dict:
     for key, value in batch.items():
         if isinstance(value, torch.Tensor):
