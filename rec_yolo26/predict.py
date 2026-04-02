@@ -66,7 +66,7 @@ def main(args):
             obb[:, 0] = (obb[:, 0] - padw) / ratio
             obb[:, 1] = (obb[:, 1] - padh) / ratio
             obb[:, 2:4] = obb[:, 2:4] / ratio
-            poly = xywhr_to_xyxyxyxy(obb)[0].cpu().numpy().tolist()
+            poly = xywhr_to_xyxyxyxy(obb)[0].cpu().numpy()
             draw.polygon(poly, outline="red", width=2)
             draw.text((poly[0][0], poly[0][1]), label, fill="red")
         else:
