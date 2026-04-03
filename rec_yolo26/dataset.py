@@ -171,6 +171,10 @@ class YOLO26Dataset(Dataset):
         names: dict[int, str],
         augment_cfg: Optional[AugmentConfig] = None,
         obb_format: str = "xywhr",
+        rect: bool = False,
+        batch_size: int = 16,
+        stride: int = 32,
+        pad: float = 0.5,
     ):
         if task not in SUPPORTED_TASKS:
             raise NotImplementedError(f"Only {sorted(SUPPORTED_TASKS)} are supported, but got '{task}'.")
@@ -180,10 +184,19 @@ class YOLO26Dataset(Dataset):
         self.names = names
         self.augment_cfg = augment_cfg or AugmentConfig()
         self.obb_format = obb_format.lower()
+        self.rect = rect
+        self.batch_size = max(int(batch_size), 1)
+        self.stride = max(int(stride), 1)
+        self.pad = float(pad)
         if self.task == "obb" and self.obb_format not in {"xywhr", "xyxyr"}:
             raise ValueError(f"Unsupported obb_format='{obb_format}', expected one of ('xywhr', 'xyxyr').")
         self.images = list_images(image_root)
         self.labels = [self._label_path(path) for path in self.images]
+        self.ni = len(self.images)
+        self.batch = np.floor(np.arange(self.ni) / self.batch_size).astype(int) if self.ni else np.zeros((0,), dtype=int)
+        self.batch_shapes: Optional[np.ndarray] = None
+        if self.rect and self.ni:
+            self.set_rectangle()
 
     @staticmethod
     def _label_path(image_path: Path) -> Path:
@@ -194,6 +207,35 @@ class YOLO26Dataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.images)
+
+    def set_rectangle(self) -> None:
+        """Sort images by aspect ratio and precompute per-batch target shapes for rectangular batching."""
+        shapes = []
+        for p in self.images:
+            with Image.open(p) as im:
+                w, h = im.size
+            shapes.append((h, w))
+        shapes = np.asarray(shapes, dtype=np.float32)
+        ar = shapes[:, 0] / shapes[:, 1]  # h/w
+        irect = ar.argsort()
+        self.images = [self.images[i] for i in irect]
+        self.labels = [self.labels[i] for i in irect]
+        ar = ar[irect]
+        bi = np.floor(np.arange(self.ni) / self.batch_size).astype(int)
+        nb = bi[-1] + 1 if self.ni else 0
+        batch_shapes = [[1, 1]] * nb
+        for i in range(nb):
+            ari = ar[bi == i]
+            if len(ari) == 0:
+                continue
+            mini, maxi = ari.min(), ari.max()
+            if maxi < 1:
+                batch_shapes[i] = [maxi, 1]
+            elif mini > 1:
+                batch_shapes[i] = [1, 1 / mini]
+        imgsz = np.array(self.imgsz, dtype=np.float32)
+        self.batch_shapes = np.ceil(np.array(batch_shapes) * imgsz / self.stride + self.pad).astype(int) * self.stride
+        self.batch = bi
 
     def _load_labels(self, label_path: Path, image_hw: Optional[tuple[int, int]] = None):
         cols = 5 if self.task == "detect" else 6
@@ -236,14 +278,16 @@ class YOLO26Dataset(Dataset):
         cls, boxes = self._load_labels(self.labels[index], image_hw=original_shape)
         if self.augment:
             image = augment_hsv(image, self.augment_cfg)
-        image, ratio, pad = letterbox(image, self.imgsz)
+        target_shape = tuple(self.batch_shapes[self.batch[index]].tolist()) if self.rect and self.batch_shapes is not None else self.imgsz
+        image, ratio, pad = letterbox(image, target_shape)
+        target_h, target_w = normalize_imgsz(target_shape)
         if boxes.shape[0]:
             boxes = boxes.copy()
             boxes[:, 0] = boxes[:, 0] * original_shape[1] * ratio + pad[0]
             boxes[:, 1] = boxes[:, 1] * original_shape[0] * ratio + pad[1]
             boxes[:, 2] = boxes[:, 2] * original_shape[1] * ratio
             boxes[:, 3] = boxes[:, 3] * original_shape[0] * ratio
-            boxes[:, :4] /= np.array([self.imgsz[1], self.imgsz[0], self.imgsz[1], self.imgsz[0]], dtype=np.float32)
+            boxes[:, :4] /= np.array([target_w, target_h, target_w, target_h], dtype=np.float32)
         if self.augment and random.random() < self.augment_cfg.fliplr:
             image = ImageOps.mirror(image)
             if boxes.shape[0]:
@@ -287,6 +331,8 @@ def build_dataset(data: dict[str, Any], split: str, task: str, imgsz: Union[int,
 
 def build_dataloader(dataset: YOLO26Dataset, batch_size: int, workers: int, shuffle: bool):
     batch_size = min(batch_size, max(len(dataset), 1))
+    if dataset.rect and shuffle and dataset.batch_shapes is not None and not np.all(dataset.batch_shapes == dataset.batch_shapes[0]):
+        shuffle = False
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=workers, pin_memory=True, collate_fn=dataset.collate_fn)
 
 
@@ -300,11 +346,32 @@ def create_train_val_dataloaders(
     stride: int = 32,
     train_augment: bool = True,
 ):
-    del stride  # retained for API compatibility with the original entrypoints
     data = load_data_config(data_yaml)
-    train_dataset = build_dataset(data, "train", task, imgsz, augment=train_augment)
+    train_dataset = YOLO26Dataset(
+        data["train"],
+        task=task,
+        imgsz=imgsz,
+        augment=train_augment,
+        names=data["names"],
+        obb_format=data.get("obb_format", "xywhr"),
+        rect=False,
+        batch_size=batch_size,
+        stride=stride,
+        pad=0.0,
+    )
     split = eval_split if eval_split in data and data.get(eval_split) else "val"
-    eval_dataset = build_dataset(data, split, task, imgsz, augment=False)
+    eval_dataset = YOLO26Dataset(
+        data[split],
+        task=task,
+        imgsz=imgsz,
+        augment=False,
+        names=data["names"],
+        obb_format=data.get("obb_format", "xywhr"),
+        rect=True,
+        batch_size=batch_size,
+        stride=stride,
+        pad=0.5,
+    )
     train_loader = build_dataloader(train_dataset, batch_size=batch_size, workers=workers, shuffle=True)
     eval_loader = build_dataloader(eval_dataset, batch_size=batch_size, workers=workers, shuffle=False)
     return data, train_loader, eval_loader
