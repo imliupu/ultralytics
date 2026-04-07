@@ -109,19 +109,42 @@ def normalize_imgsz(imgsz: Union[int, tuple[int, int], list[int]]) -> tuple[int,
     raise ValueError(f"Invalid imgsz={imgsz!r}, expected int or 2-int tuple/list.")
 
 
-def letterbox(image: Image.Image, new_shape: Union[int, tuple[int, int]]) -> tuple[Image.Image, float, tuple[int, int]]:
+def letterbox(
+    image: Image.Image,
+    new_shape: Union[int, tuple[int, int]],
+    auto: bool = False,
+    scale_fill: bool = False,
+    scaleup: bool = True,
+    center: bool = True,
+    stride: int = 32,
+    padding_value: int = 114,
+) -> tuple[Image.Image, float, tuple[int, int]]:
+    """Resize and pad image following Ultralytics LetterBox behavior."""
     new_h, new_w = normalize_imgsz(new_shape)
     w, h = image.size
-    ratio = min(new_h / h, new_w / w)
-    new_unpad = (int(round(w * ratio)), int(round(h * ratio)))
+    r = min(new_h / h, new_w / w)
+    if not scaleup:
+        r = min(r, 1.0)
+    ratio = r
+    new_unpad = (int(round(w * r)), int(round(h * r)))
     dw, dh = new_w - new_unpad[0], new_h - new_unpad[1]
-    dw //= 2
-    dh //= 2
+    if auto:
+        dw, dh = dw % stride, dh % stride
+    elif scale_fill:
+        dw, dh = 0.0, 0.0
+        new_unpad = (new_w, new_h)
+    if center:
+        dw /= 2
+        dh /= 2
     if image.size != new_unpad:
         image = image.resize(new_unpad, Image.BILINEAR)
-    canvas = Image.new("RGB", (new_w, new_h), (114, 114, 114))
-    canvas.paste(image, (dw, dh))
-    return canvas, ratio, (dw, dh)
+    left = round(dw - 0.1) if center else 0
+    top = round(dh - 0.1) if center else 0
+    right = round(dw + 0.1)
+    bottom = round(dh + 0.1)
+    canvas = Image.new("RGB", (new_unpad[0] + left + right, new_unpad[1] + top + bottom), (padding_value,) * 3)
+    canvas.paste(image, (left, top))
+    return canvas, ratio, (left, top)
 
 
 def augment_hsv(image: Image.Image, cfg: AugmentConfig) -> Image.Image:
@@ -279,7 +302,7 @@ class YOLO26Dataset(Dataset):
         if self.augment:
             image = augment_hsv(image, self.augment_cfg)
         target_shape = tuple(self.batch_shapes[self.batch[index]].tolist()) if self.rect and self.batch_shapes is not None else self.imgsz
-        image, ratio, pad = letterbox(image, target_shape)
+        image, ratio, pad = letterbox(image, target_shape, stride=self.stride, padding_value=114)
         target_h, target_w = normalize_imgsz(target_shape)
         if boxes.shape[0]:
             boxes = boxes.copy()
