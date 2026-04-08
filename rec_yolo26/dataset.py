@@ -8,7 +8,7 @@ from typing import Any, Optional, Union
 
 import numpy as np
 import torch
-from PIL import Image, ImageOps
+from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
 from .ops import yaml_load
@@ -111,7 +111,7 @@ def normalize_imgsz(imgsz: Union[int, tuple[int, int], list[int]]) -> tuple[int,
 
 
 def letterbox(
-    image: Image.Image,
+    image: Union[Image.Image, np.ndarray],
     new_shape: Union[int, tuple[int, int]],
     auto: bool = False,
     scale_fill: bool = False,
@@ -119,10 +119,17 @@ def letterbox(
     center: bool = True,
     stride: int = 32,
     padding_value: int = 114,
-) -> tuple[Image.Image, float, tuple[int, int]]:
+) -> tuple[np.ndarray, float, tuple[int, int]]:
     """Resize and pad image following Ultralytics LetterBox behavior."""
+    try:
+        import cv2
+    except Exception:
+        cv2 = None
+
+    if isinstance(image, Image.Image):
+        image = np.asarray(image, dtype=np.uint8)
     new_h, new_w = normalize_imgsz(new_shape)
-    w, h = image.size
+    h, w = image.shape[:2]
     r = min(new_h / h, new_w / w)
     if not scaleup:
         r = min(r, 1.0)
@@ -137,24 +144,45 @@ def letterbox(
     if center:
         dw /= 2
         dh /= 2
-    if image.size != new_unpad:
-        image = image.resize(new_unpad, Image.BILINEAR)
+    if (w, h) != new_unpad:
+        if cv2 is not None:
+            image = cv2.resize(image, new_unpad, interpolation=cv2.INTER_LINEAR)
+        else:
+            image = np.asarray(Image.fromarray(image).resize(new_unpad, Image.BILINEAR), dtype=np.uint8)
     left = round(dw - 0.1) if center else 0
     top = round(dh - 0.1) if center else 0
     right = round(dw + 0.1)
     bottom = round(dh + 0.1)
-    canvas = Image.new("RGB", (new_unpad[0] + left + right, new_unpad[1] + top + bottom), (padding_value,) * 3)
-    canvas.paste(image, (left, top))
-    return canvas, ratio, (left, top)
+    if cv2 is not None:
+        image = cv2.copyMakeBorder(image, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(padding_value,) * 3)
+    else:
+        canvas = np.full((image.shape[0] + top + bottom, image.shape[1] + left + right, image.shape[2]), padding_value, dtype=image.dtype)
+        canvas[top : top + image.shape[0], left : left + image.shape[1]] = image
+        image = canvas
+    return image, ratio, (left, top)
 
 
-def augment_hsv(image: Image.Image, cfg: AugmentConfig) -> Image.Image:
-    hsv = np.array(image.convert("HSV"), dtype=np.float32)
-    gains = np.array([cfg.hsv_h, cfg.hsv_s, cfg.hsv_v]) * np.random.uniform(-1, 1, 3) + 1
-    hsv[..., 0] = (hsv[..., 0] * gains[0]) % 255
-    hsv[..., 1] = np.clip(hsv[..., 1] * gains[1], 0, 255)
-    hsv[..., 2] = np.clip(hsv[..., 2] * gains[2], 0, 255)
-    return Image.fromarray(hsv.astype(np.uint8), mode="HSV").convert("RGB")
+def augment_hsv(image: np.ndarray, cfg: AugmentConfig) -> np.ndarray:
+    """Ultralytics-consistent HSV augmentation on BGR uint8 image."""
+    if image.shape[-1] != 3:
+        return image
+    if not (cfg.hsv_h or cfg.hsv_s or cfg.hsv_v):
+        return image
+    try:
+        import cv2
+    except Exception:
+        return image
+    dtype = image.dtype
+    r = np.random.uniform(-1, 1, 3) * [cfg.hsv_h, cfg.hsv_s, cfg.hsv_v]
+    x = np.arange(0, 256, dtype=r.dtype)
+    lut_hue = ((x + r[0] * 180) % 180).astype(dtype)
+    lut_sat = np.clip(x * (r[1] + 1), 0, 255).astype(dtype)
+    lut_val = np.clip(x * (r[2] + 1), 0, 255).astype(dtype)
+    lut_sat[0] = 0
+    hue, sat, val = cv2.split(cv2.cvtColor(image, cv2.COLOR_BGR2HSV))
+    hsv = cv2.merge((cv2.LUT(hue, lut_hue), cv2.LUT(sat, lut_sat), cv2.LUT(val, lut_val)))
+    cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR, dst=image)
+    return image
 
 
 def polygon_to_xywhr(points: np.ndarray) -> np.ndarray:
@@ -297,8 +325,15 @@ class YOLO26Dataset(Dataset):
 
     def __getitem__(self, index: int):
         image_path = self.images[index]
-        image = Image.open(image_path).convert("RGB")
-        original_shape = image.size[1], image.size[0]
+        try:
+            import cv2
+
+            image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)  # BGR
+        except Exception:
+            image = None
+        if image is None:
+            image = np.asarray(Image.open(image_path).convert("RGB"), dtype=np.uint8)[..., ::-1]  # RGB->BGR
+        original_shape = image.shape[0], image.shape[1]
         cls, boxes = self._load_labels(self.labels[index], image_hw=original_shape)
         if self.augment:
             image = augment_hsv(image, self.augment_cfg)
@@ -322,18 +357,18 @@ class YOLO26Dataset(Dataset):
             boxes[:, 3] = boxes[:, 3] * original_shape[0] * ratio
             boxes[:, :4] /= np.array([target_w, target_h, target_w, target_h], dtype=np.float32)
         if self.augment and random.random() < self.augment_cfg.fliplr:
-            image = ImageOps.mirror(image)
+            image = np.ascontiguousarray(image[:, ::-1])
             if boxes.shape[0]:
                 boxes[:, 0] = 1.0 - boxes[:, 0]
                 if self.task == "obb":
                     boxes[:, 4] *= -1
         if self.augment and random.random() < self.augment_cfg.flipud:
-            image = ImageOps.flip(image)
+            image = np.ascontiguousarray(image[::-1])
             if boxes.shape[0]:
                 boxes[:, 1] = 1.0 - boxes[:, 1]
                 if self.task == "obb":
                     boxes[:, 4] *= -1
-        image = np.asarray(image, dtype=np.uint8)[..., ::-1].transpose(2, 0, 1)  # PIL RGB -> BGR CHW
+        image = np.asarray(image, dtype=np.uint8).transpose(2, 0, 1)  # BGR CHW
         if random.uniform(0, 1) > self.augment_cfg.bgr and image.shape[0] == 3:
             image = image[::-1]  # BGR->RGB (default when bgr=0.0), matching Ultralytics Format behavior
         return {
