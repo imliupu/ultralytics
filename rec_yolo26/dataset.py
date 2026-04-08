@@ -24,6 +24,7 @@ class AugmentConfig:
     hsv_v: float = 0.4
     fliplr: float = 0.5
     flipud: float = 0.0
+    bgr: float = 0.0
 
 
 def _normalize_angle(angle: float) -> float:
@@ -302,7 +303,16 @@ class YOLO26Dataset(Dataset):
         if self.augment:
             image = augment_hsv(image, self.augment_cfg)
         target_shape = tuple(self.batch_shapes[self.batch[index]].tolist()) if self.rect and self.batch_shapes is not None else self.imgsz
-        image, ratio, pad = letterbox(image, target_shape, stride=self.stride, padding_value=114)
+        image, ratio, pad = letterbox(
+            image,
+            target_shape,
+            auto=False,
+            scale_fill=False,
+            scaleup=self.augment,
+            center=True,
+            stride=self.stride,
+            padding_value=114,
+        )
         target_h, target_w = normalize_imgsz(target_shape)
         if boxes.shape[0]:
             boxes = boxes.copy()
@@ -323,7 +333,9 @@ class YOLO26Dataset(Dataset):
                 boxes[:, 1] = 1.0 - boxes[:, 1]
                 if self.task == "obb":
                     boxes[:, 4] *= -1
-        image = np.asarray(image, dtype=np.uint8).transpose(2, 0, 1)
+        image = np.asarray(image, dtype=np.uint8)[..., ::-1].transpose(2, 0, 1)  # PIL RGB -> BGR CHW
+        if random.uniform(0, 1) > self.augment_cfg.bgr and image.shape[0] == 3:
+            image = image[::-1]  # BGR->RGB (default when bgr=0.0), matching Ultralytics Format behavior
         return {
             "img": torch.from_numpy(np.ascontiguousarray(image)),
             "cls": torch.from_numpy(cls),
