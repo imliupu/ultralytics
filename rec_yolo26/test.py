@@ -24,7 +24,10 @@ def main(args):
     data = load_data_config(args.data)
     model = RecYOLO26Model.build(task=args.task, nc=data["nc"], model=args.model, verbose=not args.quiet)
     model.load(args.weights)
+    if args.fuse:
+        model.fuse()
     model.to(device)
+    model.eval()
     model.names = data["names"]
     _, _, dataloader = create_train_val_dataloaders(args.data, args.task, imgsz, args.batch, args.workers, eval_split=args.split)
     metrics = evaluate_model(model, dataloader, device, args.task, data["names"], EvalConfig(conf=args.conf, iou=args.iou, max_det=args.max_det))
@@ -45,6 +48,7 @@ def build_parser():
     parser.add_argument("--iou", type=float, default=0.7)
     parser.add_argument("--max_det", type=int, default=300)
     parser.add_argument("--split", default="test")
+    parser.add_argument("--fuse", action=argparse.BooleanOptionalAction, default=True, help="Fuse Conv+BN for eval.")
     parser.add_argument("--quiet", action="store_true")
     return parser
 

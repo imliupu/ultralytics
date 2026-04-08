@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 
 from .loss import build_criterion
+from .modules import Conv
 from .ops import build_model_from_yaml, dist2bbox, dist2rbox, make_anchors, non_max_suppression, yaml_load
 
 CONFIG_DIR = Path(__file__).resolve().parent / "configs"
@@ -91,6 +92,33 @@ class RecYOLO26Model(nn.Module):
         if preds is None:
             preds = self.forward(batch["img"])
         return self.criterion(preds, batch)
+
+    def fuse(self):
+        """Fuse Conv2d + BatchNorm2d layers for inference, matching Ultralytics eval/infer behavior."""
+        for m in self.modules():
+            if isinstance(m, Conv) and hasattr(m, "bn"):
+                conv = m.conv
+                bn = m.bn
+                fused = nn.Conv2d(
+                    conv.in_channels,
+                    conv.out_channels,
+                    kernel_size=conv.kernel_size,
+                    stride=conv.stride,
+                    padding=conv.padding,
+                    dilation=conv.dilation,
+                    groups=conv.groups,
+                    bias=True,
+                ).to(conv.weight.device)
+                w_conv = conv.weight.view(conv.out_channels, -1)
+                w_bn = torch.diag(bn.weight.div(torch.sqrt(bn.running_var + bn.eps)))
+                fused.weight.data = torch.mm(w_bn, w_conv).view(fused.weight.shape)
+                b_conv = torch.zeros(conv.out_channels, device=conv.weight.device) if conv.bias is None else conv.bias
+                b_bn = bn.bias - bn.weight.mul(bn.running_mean).div(torch.sqrt(bn.running_var + bn.eps))
+                fused.bias.data = torch.mm(w_bn, b_conv.reshape(-1, 1)).reshape(-1) + b_bn
+                m.conv = fused
+                delattr(m, "bn")
+                m.forward = m.forward_fuse
+        return self
 
     def _infer_stride(self, ch: int) -> torch.Tensor:
         training = self.training
