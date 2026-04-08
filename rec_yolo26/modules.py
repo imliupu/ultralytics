@@ -30,6 +30,9 @@ class Conv(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.act(self.bn(self.conv(x)))
 
+    def forward_fuse(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(self.conv(x))
+
 
 class DWConv(Conv):
     def __init__(self, c1, c2, k=1, s=1, d=1, act=True):
