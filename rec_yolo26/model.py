@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 
 from .loss import build_criterion
-from .modules import Conv
+from .modules import Conv, Detect
 from .ops import build_model_from_yaml, dist2bbox, dist2rbox, make_anchors, non_max_suppression, yaml_load
 
 CONFIG_DIR = Path(__file__).resolve().parent / "configs"
@@ -95,6 +95,9 @@ class RecYOLO26Model(nn.Module):
 
     def fuse(self):
         """Fuse Conv2d + BatchNorm2d layers for inference, matching Ultralytics eval/infer behavior."""
+        bn_count = sum(isinstance(m, nn.BatchNorm2d) for m in self.modules())
+        if bn_count < 10:
+            return self
         for m in self.modules():
             if isinstance(m, Conv) and hasattr(m, "bn"):
                 conv = m.conv
@@ -118,6 +121,8 @@ class RecYOLO26Model(nn.Module):
                 m.conv = fused
                 delattr(m, "bn")
                 m.forward = m.forward_fuse
+            if isinstance(m, Detect) and getattr(m, "end2end", False):
+                m.fuse()
         return self
 
     def _infer_stride(self, ch: int) -> torch.Tensor:
