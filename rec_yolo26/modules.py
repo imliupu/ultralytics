@@ -30,6 +30,9 @@ class Conv(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.act(self.bn(self.conv(x)))
 
+    def forward_fuse(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(self.conv(x))
+
 
 class DWConv(Conv):
     def __init__(self, c1, c2, k=1, s=1, d=1, act=True):
@@ -250,6 +253,9 @@ class Detect(nn.Module):
         return {"boxes": boxes, "scores": scores, "feats": x}
 
     def forward(self, x: list[torch.Tensor]):
+        if self.end2end and (self.cv2 is None or self.cv3 is None):
+            preds = self.forward_head(x, **self.one2one)
+            return preds
         preds = self.forward_head(x, **self.one2many)
         if self.end2end:
             x_detach = [xi.detach() for xi in x]
@@ -257,6 +263,10 @@ class Detect(nn.Module):
         if self.training:
             return preds
         return preds
+
+    def fuse(self) -> None:
+        """Remove one2many heads for end2end inference optimization."""
+        self.cv2 = self.cv3 = None
 
 
 class OBB(Detect):
@@ -283,6 +293,10 @@ class OBB(Detect):
             angle = torch.cat([angle_head[i](x[i]).view(bs, self.ne, -1) for i in range(self.nl)], dim=2)
             preds["angle"] = (angle.sigmoid() - 0.25) * math.pi
         return preds
+
+    def fuse(self) -> None:
+        """Remove one2many heads for end2end inference optimization."""
+        self.cv2 = self.cv3 = self.cv4 = None
 
 
 class OBB26(OBB):
