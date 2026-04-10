@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 
 from .loss import build_criterion
-from .modules import Conv, Detect
+from .modules import Detect
 from .ops import build_model_from_yaml, dist2bbox, dist2rbox, make_anchors, non_max_suppression, yaml_load
 
 CONFIG_DIR = Path(__file__).resolve().parent / "configs"
@@ -46,7 +46,17 @@ class RecYOLO26Model(nn.Module):
         self.criterion = None
         self.stride = self._infer_stride(ch)
         self.model[-1].stride = self.stride
+        self._initialize_modules()
         self._init_head_biases()
+
+    def _initialize_modules(self) -> None:
+        """Align module defaults with Ultralytics initialize_weights behavior."""
+        for m in self.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.eps = 1e-3
+                m.momentum = 0.03
+            elif isinstance(m, (nn.Hardswish, nn.LeakyReLU, nn.ReLU, nn.ReLU6, nn.SiLU)):
+                m.inplace = True
 
     @staticmethod
     def resolve_model_cfg(model: str, task: str) -> Path:
@@ -99,31 +109,58 @@ class RecYOLO26Model(nn.Module):
         if bn_count < 10:
             return self
         for m in self.modules():
-            if isinstance(m, Conv) and hasattr(m, "bn"):
-                conv = m.conv
-                bn = m.bn
-                fused = nn.Conv2d(
-                    conv.in_channels,
-                    conv.out_channels,
-                    kernel_size=conv.kernel_size,
-                    stride=conv.stride,
-                    padding=conv.padding,
-                    dilation=conv.dilation,
-                    groups=conv.groups,
-                    bias=True,
-                ).to(conv.weight.device)
-                w_conv = conv.weight.view(conv.out_channels, -1)
-                w_bn = torch.diag(bn.weight.div(torch.sqrt(bn.running_var + bn.eps)))
-                fused.weight.data = torch.mm(w_bn, w_conv).view(fused.weight.shape)
-                b_conv = torch.zeros(conv.out_channels, device=conv.weight.device) if conv.bias is None else conv.bias
-                b_bn = bn.bias - bn.weight.mul(bn.running_mean).div(torch.sqrt(bn.running_var + bn.eps))
-                fused.bias.data = torch.mm(w_bn, b_conv.reshape(-1, 1)).reshape(-1) + b_bn
-                m.conv = fused
+            if hasattr(m, "conv") and hasattr(m, "bn") and hasattr(m, "forward_fuse"):
+                m.conv = self._fuse_conv_and_bn(m.conv, m.bn)
+                delattr(m, "bn")
+                m.forward = m.forward_fuse
+            if hasattr(m, "conv_transpose") and hasattr(m, "bn") and hasattr(m, "forward_fuse"):
+                m.conv_transpose = self._fuse_deconv_and_bn(m.conv_transpose, m.bn)
                 delattr(m, "bn")
                 m.forward = m.forward_fuse
             if isinstance(m, Detect) and getattr(m, "end2end", False):
                 m.fuse()
         return self
+
+    @staticmethod
+    def _fuse_conv_and_bn(conv: nn.Conv2d, bn: nn.BatchNorm2d) -> nn.Conv2d:
+        fused = nn.Conv2d(
+            conv.in_channels,
+            conv.out_channels,
+            kernel_size=conv.kernel_size,
+            stride=conv.stride,
+            padding=conv.padding,
+            dilation=conv.dilation,
+            groups=conv.groups,
+            bias=True,
+        ).to(conv.weight.device)
+        w_conv = conv.weight.view(conv.out_channels, -1)
+        w_bn = torch.diag(bn.weight.div(torch.sqrt(bn.running_var + bn.eps)))
+        fused.weight.data = torch.mm(w_bn, w_conv).view(fused.weight.shape)
+        b_conv = torch.zeros(conv.out_channels, device=conv.weight.device) if conv.bias is None else conv.bias
+        b_bn = bn.bias - bn.weight.mul(bn.running_mean).div(torch.sqrt(bn.running_var + bn.eps))
+        fused.bias.data = torch.mm(w_bn, b_conv.reshape(-1, 1)).reshape(-1) + b_bn
+        return fused
+
+    @staticmethod
+    def _fuse_deconv_and_bn(deconv: nn.ConvTranspose2d, bn: nn.BatchNorm2d) -> nn.ConvTranspose2d:
+        fused = nn.ConvTranspose2d(
+            deconv.in_channels,
+            deconv.out_channels,
+            kernel_size=deconv.kernel_size,
+            stride=deconv.stride,
+            padding=deconv.padding,
+            output_padding=deconv.output_padding,
+            dilation=deconv.dilation,
+            groups=deconv.groups,
+            bias=True,
+        ).to(deconv.weight.device)
+        w_deconv = deconv.weight.view(deconv.out_channels, -1)
+        w_bn = torch.diag(bn.weight.div(torch.sqrt(bn.running_var + bn.eps)))
+        fused.weight.data = torch.mm(w_bn, w_deconv).view(fused.weight.shape)
+        b_deconv = torch.zeros(deconv.out_channels, device=deconv.weight.device) if deconv.bias is None else deconv.bias
+        b_bn = bn.bias - bn.weight.mul(bn.running_mean).div(torch.sqrt(bn.running_var + bn.eps))
+        fused.bias.data = torch.mm(w_bn, b_deconv.reshape(-1, 1)).reshape(-1) + b_bn
+        return fused
 
     def _infer_stride(self, ch: int) -> torch.Tensor:
         training = self.training
