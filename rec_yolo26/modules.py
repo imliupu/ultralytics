@@ -255,14 +255,61 @@ class Detect(nn.Module):
     def forward(self, x: list[torch.Tensor]):
         if self.end2end and (self.cv2 is None or self.cv3 is None):
             preds = self.forward_head(x, **self.one2one)
-            return preds
+            y = self._inference(preds)
+            y = self.postprocess(y.permute(0, 2, 1))
+            return y if self.export else (y, preds)
         preds = self.forward_head(x, **self.one2many)
         if self.end2end:
             x_detach = [xi.detach() for xi in x]
             preds = {"one2many": preds, "one2one": self.forward_head(x_detach, **self.one2one)}
         if self.training:
             return preds
-        return preds
+        y = self._inference(preds["one2one"] if self.end2end else preds)
+        if self.end2end:
+            y = self.postprocess(y.permute(0, 2, 1))
+        return y if self.export else (y, preds)
+
+    def _inference(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
+        dbox = self._get_decode_boxes(x)
+        return torch.cat((dbox, x["scores"].sigmoid()), 1)
+
+    def _get_decode_boxes(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
+        from .ops import dist2bbox, make_anchors
+
+        shape = x["feats"][0].shape
+        if self.dynamic or self.shape != shape:
+            self.anchors, self.strides = (a.transpose(0, 1) for a in make_anchors(x["feats"], self.stride, 0.5))
+            self.shape = shape
+        return self.decode_bboxes(self.dfl(x["boxes"]), self.anchors.unsqueeze(0)) * self.strides
+
+    def decode_bboxes(self, bboxes: torch.Tensor, anchors: torch.Tensor, xywh: bool = True) -> torch.Tensor:
+        from .ops import dist2bbox
+
+        return dist2bbox(bboxes, anchors, xywh=xywh and not self.end2end and not self.xyxy, dim=1)
+
+    def get_topk_index(self, scores: torch.Tensor, max_det: int):
+        bs, anchors, nc = scores.shape
+        k = max_det if self.export else min(max_det, anchors)
+        if self.agnostic_nms:
+            scores, labels = scores.max(dim=-1, keepdim=True)
+            scores, idx = scores.topk(k, dim=1)
+            labels = labels.gather(1, idx)
+            return scores, labels, idx
+        ori_index = scores.max(dim=-1)[0].topk(k)[1].unsqueeze(-1)
+        scores = scores.gather(dim=1, index=ori_index.repeat(1, 1, nc))
+        scores, index = scores.flatten(1).topk(k)
+        idx = ori_index[torch.arange(bs)[..., None], index // nc]
+        return scores[..., None], (index % nc)[..., None].float(), idx
+
+    def postprocess(self, preds: torch.Tensor) -> torch.Tensor:
+        boxes, scores = preds.split([4, self.nc], dim=-1)
+        scores, conf, idx = self.get_topk_index(scores, self.max_det)
+        boxes = boxes.gather(dim=1, index=idx.repeat(1, 1, 4))
+        return torch.cat([boxes, scores, conf], dim=-1)
+
+    def fuse(self) -> None:
+        """Remove one2many heads for end2end inference optimization."""
+        self.cv2 = self.cv3 = None
 
     def fuse(self) -> None:
         """Remove one2many heads for end2end inference optimization."""
@@ -293,6 +340,23 @@ class OBB(Detect):
             angle = torch.cat([angle_head[i](x[i]).view(bs, self.ne, -1) for i in range(self.nl)], dim=2)
             preds["angle"] = (angle.sigmoid() - 0.25) * math.pi
         return preds
+
+    def _inference(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
+        self.angle = x["angle"]
+        preds = super()._inference(x)
+        return torch.cat([preds, x["angle"]], dim=1)
+
+    def decode_bboxes(self, bboxes: torch.Tensor, anchors: torch.Tensor) -> torch.Tensor:
+        from .ops import dist2rbox
+
+        return dist2rbox(bboxes, self.angle, anchors, dim=1)
+
+    def postprocess(self, preds: torch.Tensor) -> torch.Tensor:
+        boxes, scores, angle = preds.split([4, self.nc, self.ne], dim=-1)
+        scores, conf, idx = self.get_topk_index(scores, self.max_det)
+        boxes = boxes.gather(dim=1, index=idx.repeat(1, 1, 4))
+        angle = angle.gather(dim=1, index=idx.repeat(1, 1, self.ne))
+        return torch.cat([boxes, scores, conf, angle], dim=-1)
 
     def fuse(self) -> None:
         """Remove one2many heads for end2end inference optimization."""

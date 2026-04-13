@@ -214,6 +214,21 @@ class RecYOLO26Model(nn.Module):
 
     @torch.inference_mode()
     def postprocess(self, raw_preds, conf: float = 0.25, iou: float = 0.7, max_det: int = 300):
+        if isinstance(raw_preds, tuple):
+            infer, aux = raw_preds
+            if self.end2end:
+                outputs = []
+                for bi in range(infer.shape[0]):
+                    x = infer[bi]
+                    keep = x[:, 4] > conf
+                    x = x[keep]
+                    if x.numel() == 0:
+                        outputs.append({"bboxes": x[:, :5] if self.task == "obb" else x[:, :4], "conf": x[:, 4], "cls": x[:, 5]})
+                        continue
+                    bboxes = torch.cat((x[:, :4], x[:, 6:])) if self.task == "obb" else x[:, :4]
+                    outputs.append({"bboxes": bboxes, "conf": x[:, 4], "cls": x[:, 5]})
+                return outputs
+            raw_preds = aux
         preds = raw_preds["one2one"] if isinstance(raw_preds, dict) and "one2one" in raw_preds else raw_preds
         decoded = self.decode_predictions(preds)
         if self.end2end:
