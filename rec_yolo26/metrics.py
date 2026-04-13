@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Optional
 
+import numpy as np
 import torch
 
 from .ops import batch_probiou, box_iou, xywh_to_xyxy
