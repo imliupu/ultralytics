@@ -225,7 +225,7 @@ class RecYOLO26Model(nn.Module):
                     if x.numel() == 0:
                         outputs.append({"bboxes": x[:, :5] if self.task == "obb" else x[:, :4], "conf": x[:, 4], "cls": x[:, 5]})
                         continue
-                    bboxes = torch.cat((x[:, :4], x[:, 6:])) if self.task == "obb" else x[:, :4]
+                    bboxes = torch.cat((x[:, :4], x[:, 6:]), dim=-1) if self.task == "obb" else x[:, :4]
                     outputs.append({"bboxes": bboxes, "conf": x[:, 4], "cls": x[:, 5]})
                 return outputs
             raw_preds = aux

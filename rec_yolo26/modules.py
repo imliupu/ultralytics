@@ -311,10 +311,6 @@ class Detect(nn.Module):
         """Remove one2many heads for end2end inference optimization."""
         self.cv2 = self.cv3 = None
 
-    def fuse(self) -> None:
-        """Remove one2many heads for end2end inference optimization."""
-        self.cv2 = self.cv3 = None
-
 
 class OBB(Detect):
     def __init__(self, nc=80, ne=1, reg_max=16, end2end=False, ch=()):
