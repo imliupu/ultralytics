@@ -106,7 +106,8 @@ def compute_ap(recall: list[float], precision: list[float]):
     mpre = np.concatenate(([1.0], precision, [0.0]))
     mpre = np.flip(np.maximum.accumulate(np.flip(mpre)))
     x = np.linspace(0, 1, 101)
-    ap = np.trapz(np.interp(x, mrec, mpre), x)
+    func = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+    ap = func(np.interp(x, mrec, mpre), x)
     return ap, mpre, mrec
 
 
@@ -135,7 +136,8 @@ def ap_per_class(tp, conf, pred_cls, target_cls, names: dict[int, str] = {}, eps
                 prec_values.append(np.interp(x, mrec, mpre))
     prec_values = np.array(prec_values) if prec_values else np.zeros((1, 1000))
     f1_curve = 2 * p_curve * r_curve / (p_curve + r_curve + eps)
-    i = smooth(f1_curve.mean(0), 0.1).argmax() if f1_curve.size else 0
+    names = {i: names[k] for i, k in enumerate(unique_classes) if k in names}
+    i = smooth(f1_curve.mean(0), 0.1).argmax()
     p, r, f1 = p_curve[:, i], r_curve[:, i], f1_curve[:, i]
     tp = (r * nt).round()
     fp = (tp / (p + eps) - tp).round()
