@@ -162,21 +162,22 @@ class DetectionMetricEvaluator:
                 bbox = xywh_to_xyxy(bbox) * torch.tensor(imgsz, device=bbox.device)[[1, 0, 1, 0]]
         return {"cls": cls, "bboxes": bbox}
 
-    def match_predictions(self, pred_classes, true_classes, iou):
+    def match_predictions(self, pred_classes: torch.Tensor, true_classes: torch.Tensor, iou: torch.Tensor):
         correct = np.zeros((pred_classes.shape[0], self.niou), dtype=bool)
         if iou.shape[0] == 0 or iou.shape[1] == 0:
-            return torch.from_numpy(correct)
-        correct_class = true_classes[:, None] == pred_classes
+            return torch.tensor(correct, dtype=torch.bool, device=pred_classes.device)
+
+        iou = (iou * (true_classes[:, None] == pred_classes)).cpu().numpy()
         for i, thr in enumerate(self.iouv.cpu().tolist()):
-            matches = torch.nonzero((iou >= thr) & correct_class)
+            matches = np.nonzero(iou >= thr)
+            matches = np.array(matches).T
             if matches.shape[0]:
-                matches = matches.cpu().numpy()
                 if matches.shape[0] > 1:
-                    matches = matches[iou[matches[:, 0], matches[:, 1]].cpu().numpy().argsort()[::-1]]
+                    matches = matches[iou[matches[:, 0], matches[:, 1]].argsort()[::-1]]
                     matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
                     matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
                 correct[matches[:, 1].astype(int), i] = True
-        return torch.tensor(correct, dtype=torch.bool)
+        return torch.tensor(correct, dtype=torch.bool, device=pred_classes.device)
 
     def _process_batch(self, preds: dict[str, torch.Tensor], batch: dict[str, Any]):
         if batch["cls"].shape[0] == 0 or preds["cls"].shape[0] == 0:
@@ -192,13 +193,15 @@ class DetectionMetricEvaluator:
             pbatch = self._prepare_batch(si, batch)
             cls = pbatch["cls"].cpu().numpy()
             no_pred = pred["cls"].shape[0] == 0
-            self.metrics.update_stats({
-                **self._process_batch(pred, pbatch),
-                "target_cls": cls,
-                "target_img": np.unique(cls),
-                "conf": np.zeros(0) if no_pred else pred["conf"].detach().cpu().numpy(),
-                "pred_cls": np.zeros(0) if no_pred else pred["cls"].detach().cpu().numpy(),
-            })
+            self.metrics.update_stats(
+                {
+                    **self._process_batch(pred, pbatch),
+                    "target_cls": cls,
+                    "target_img": np.unique(cls),
+                    "conf": np.zeros(0) if no_pred else pred["conf"].detach().cpu().numpy(),
+                    "pred_cls": np.zeros(0) if no_pred else pred["cls"].detach().cpu().numpy(),
+                }
+            )
 
 
 def build_metric_evaluator(task: str, names: dict[int, str]):
