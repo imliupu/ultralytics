@@ -225,6 +225,8 @@ class v8DetectionLoss:
         if self.use_dfl:
             b, a, c = pred_dist.shape
             pred_dist = pred_dist.view(b, a, 4, c // 4).softmax(3).matmul(self.proj.type(pred_dist.dtype))
+        else:
+            pred_dist = nn.functional.softplus(pred_dist)
         return dist2bbox(pred_dist, anchor_points, xywh=False)
 
     def get_assigned_targets_and_loss(self, preds: dict[str, torch.Tensor], batch: dict[str, Any]):
@@ -283,6 +285,8 @@ class v8OBBLoss(v8DetectionLoss):
         if self.use_dfl:
             b, a, c = pred_dist.shape
             pred_dist = pred_dist.view(b, a, 4, c // 4).softmax(3).matmul(self.proj.type(pred_dist.dtype))
+        else:
+            pred_dist = nn.functional.softplus(pred_dist)
         return torch.cat((dist2rbox(pred_dist, pred_angle, anchor_points), pred_angle), dim=-1)
 
     def calculate_angle_loss(self, pred_bboxes, target_bboxes, fg_mask, weight, target_scores_sum, lambda_val=3):
