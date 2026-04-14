@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Optional
 
+import numpy as np
 import torch
 
 from .ops import batch_probiou, box_iou, xywh_to_xyxy
@@ -106,7 +106,8 @@ def compute_ap(recall: list[float], precision: list[float]):
     mpre = np.concatenate(([1.0], precision, [0.0]))
     mpre = np.flip(np.maximum.accumulate(np.flip(mpre)))
     x = np.linspace(0, 1, 101)
-    ap = np.trapz(np.interp(x, mrec, mpre), x)
+    func = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+    ap = func(np.interp(x, mrec, mpre), x)
     return ap, mpre, mrec
 
 
@@ -135,7 +136,8 @@ def ap_per_class(tp, conf, pred_cls, target_cls, names: dict[int, str] = {}, eps
                 prec_values.append(np.interp(x, mrec, mpre))
     prec_values = np.array(prec_values) if prec_values else np.zeros((1, 1000))
     f1_curve = 2 * p_curve * r_curve / (p_curve + r_curve + eps)
-    i = smooth(f1_curve.mean(0), 0.1).argmax() if f1_curve.size else 0
+    names = {i: names[k] for i, k in enumerate(unique_classes) if k in names}
+    i = smooth(f1_curve.mean(0), 0.1).argmax()
     p, r, f1 = p_curve[:, i], r_curve[:, i], f1_curve[:, i]
     tp = (r * nt).round()
     fp = (tp / (p + eps) - tp).round()
@@ -162,21 +164,22 @@ class DetectionMetricEvaluator:
                 bbox = xywh_to_xyxy(bbox) * torch.tensor(imgsz, device=bbox.device)[[1, 0, 1, 0]]
         return {"cls": cls, "bboxes": bbox}
 
-    def match_predictions(self, pred_classes, true_classes, iou):
+    def match_predictions(self, pred_classes: torch.Tensor, true_classes: torch.Tensor, iou: torch.Tensor):
         correct = np.zeros((pred_classes.shape[0], self.niou), dtype=bool)
         if iou.shape[0] == 0 or iou.shape[1] == 0:
-            return torch.from_numpy(correct)
-        correct_class = true_classes[:, None] == pred_classes
+            return torch.tensor(correct, dtype=torch.bool, device=pred_classes.device)
+
+        iou = (iou * (true_classes[:, None] == pred_classes)).cpu().numpy()
         for i, thr in enumerate(self.iouv.cpu().tolist()):
-            matches = torch.nonzero((iou >= thr) & correct_class)
+            matches = np.nonzero(iou >= thr)
+            matches = np.array(matches).T
             if matches.shape[0]:
-                matches = matches.cpu().numpy()
                 if matches.shape[0] > 1:
-                    matches = matches[iou[matches[:, 0], matches[:, 1]].cpu().numpy().argsort()[::-1]]
+                    matches = matches[iou[matches[:, 0], matches[:, 1]].argsort()[::-1]]
                     matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
                     matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
                 correct[matches[:, 1].astype(int), i] = True
-        return torch.tensor(correct, dtype=torch.bool)
+        return torch.tensor(correct, dtype=torch.bool, device=pred_classes.device)
 
     def _process_batch(self, preds: dict[str, torch.Tensor], batch: dict[str, Any]):
         if batch["cls"].shape[0] == 0 or preds["cls"].shape[0] == 0:
@@ -192,13 +195,15 @@ class DetectionMetricEvaluator:
             pbatch = self._prepare_batch(si, batch)
             cls = pbatch["cls"].cpu().numpy()
             no_pred = pred["cls"].shape[0] == 0
-            self.metrics.update_stats({
-                **self._process_batch(pred, pbatch),
-                "target_cls": cls,
-                "target_img": np.unique(cls),
-                "conf": np.zeros(0) if no_pred else pred["conf"].detach().cpu().numpy(),
-                "pred_cls": np.zeros(0) if no_pred else pred["cls"].detach().cpu().numpy(),
-            })
+            self.metrics.update_stats(
+                {
+                    **self._process_batch(pred, pbatch),
+                    "target_cls": cls,
+                    "target_img": np.unique(cls),
+                    "conf": np.zeros(0) if no_pred else pred["conf"].detach().cpu().numpy(),
+                    "pred_cls": np.zeros(0) if no_pred else pred["cls"].detach().cpu().numpy(),
+                }
+            )
 
 
 def build_metric_evaluator(task: str, names: dict[int, str]):
