@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Optional
 
+import numpy as np
 import torch
+from tqdm.auto import tqdm
 
 from .ops import batch_probiou, box_iou, xywh_to_xyxy
 
@@ -106,7 +107,8 @@ def compute_ap(recall: list[float], precision: list[float]):
     mpre = np.concatenate(([1.0], precision, [0.0]))
     mpre = np.flip(np.maximum.accumulate(np.flip(mpre)))
     x = np.linspace(0, 1, 101)
-    ap = np.trapz(np.interp(x, mrec, mpre), x)
+    func = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+    ap = func(np.interp(x, mrec, mpre), x)
     return ap, mpre, mrec
 
 
@@ -135,7 +137,8 @@ def ap_per_class(tp, conf, pred_cls, target_cls, names: dict[int, str] = {}, eps
                 prec_values.append(np.interp(x, mrec, mpre))
     prec_values = np.array(prec_values) if prec_values else np.zeros((1, 1000))
     f1_curve = 2 * p_curve * r_curve / (p_curve + r_curve + eps)
-    i = smooth(f1_curve.mean(0), 0.1).argmax() if f1_curve.size else 0
+    names = {i: names[k] for i, k in enumerate(unique_classes) if k in names}
+    i = smooth(f1_curve.mean(0), 0.1).argmax()
     p, r, f1 = p_curve[:, i], r_curve[:, i], f1_curve[:, i]
     tp = (r * nt).round()
     fp = (tp / (p + eps) - tp).round()
@@ -162,21 +165,22 @@ class DetectionMetricEvaluator:
                 bbox = xywh_to_xyxy(bbox) * torch.tensor(imgsz, device=bbox.device)[[1, 0, 1, 0]]
         return {"cls": cls, "bboxes": bbox}
 
-    def match_predictions(self, pred_classes, true_classes, iou):
+    def match_predictions(self, pred_classes: torch.Tensor, true_classes: torch.Tensor, iou: torch.Tensor):
         correct = np.zeros((pred_classes.shape[0], self.niou), dtype=bool)
         if iou.shape[0] == 0 or iou.shape[1] == 0:
-            return torch.from_numpy(correct)
-        correct_class = true_classes[:, None] == pred_classes
+            return torch.tensor(correct, dtype=torch.bool, device=pred_classes.device)
+
+        iou = (iou * (true_classes[:, None] == pred_classes)).cpu().numpy()
         for i, thr in enumerate(self.iouv.cpu().tolist()):
-            matches = torch.nonzero((iou >= thr) & correct_class)
+            matches = np.nonzero(iou >= thr)
+            matches = np.array(matches).T
             if matches.shape[0]:
-                matches = matches.cpu().numpy()
                 if matches.shape[0] > 1:
-                    matches = matches[iou[matches[:, 0], matches[:, 1]].cpu().numpy().argsort()[::-1]]
+                    matches = matches[iou[matches[:, 0], matches[:, 1]].argsort()[::-1]]
                     matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
                     matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
                 correct[matches[:, 1].astype(int), i] = True
-        return torch.tensor(correct, dtype=torch.bool)
+        return torch.tensor(correct, dtype=torch.bool, device=pred_classes.device)
 
     def _process_batch(self, preds: dict[str, torch.Tensor], batch: dict[str, Any]):
         if batch["cls"].shape[0] == 0 or preds["cls"].shape[0] == 0:
@@ -192,13 +196,30 @@ class DetectionMetricEvaluator:
             pbatch = self._prepare_batch(si, batch)
             cls = pbatch["cls"].cpu().numpy()
             no_pred = pred["cls"].shape[0] == 0
-            self.metrics.update_stats({
-                **self._process_batch(pred, pbatch),
-                "target_cls": cls,
-                "target_img": np.unique(cls),
-                "conf": np.zeros(0) if no_pred else pred["conf"].detach().cpu().numpy(),
-                "pred_cls": np.zeros(0) if no_pred else pred["cls"].detach().cpu().numpy(),
-            })
+            self.metrics.update_stats(
+                {
+                    **self._process_batch(pred, pbatch),
+                    "target_cls": cls,
+                    "target_img": np.unique(cls),
+                    "conf": np.zeros(0) if no_pred else pred["conf"].detach().cpu().numpy(),
+                    "pred_cls": np.zeros(0) if no_pred else pred["cls"].detach().cpu().numpy(),
+                }
+            )
+
+    def running_results(self) -> dict[str, float]:
+        """Compute current metrics from accumulated stats for progress display."""
+        stats = {k: np.concatenate(v, 0) if len(v) else np.zeros((0,)) for k, v in self.metrics.stats.items()}
+        keys = ["metrics/precision(B)", "metrics/recall(B)", "metrics/mAP50(B)", "metrics/mAP50-95(B)", "fitness"]
+        if not stats["target_cls"].size:
+            return dict(zip(keys, [0.0, 0.0, 0.0, 0.0, 0.0]))
+        results = ap_per_class(stats["tp"], stats["conf"], stats["pred_cls"], stats["target_cls"], names=self.names)[2:]
+        p, r, _f1, all_ap, _cls_idx, *_ = results
+        mp = float(p.mean()) if len(p) else 0.0
+        mr = float(r.mean()) if len(r) else 0.0
+        map50 = float(all_ap[:, 0].mean()) if len(all_ap) else 0.0
+        map5095 = float(all_ap.mean()) if len(all_ap) else 0.0
+        fitness = map5095
+        return dict(zip(keys, [mp, mr, map50, map5095, fitness]))
 
 
 def build_metric_evaluator(task: str, names: dict[int, str]):
@@ -206,11 +227,21 @@ def build_metric_evaluator(task: str, names: dict[int, str]):
 
 
 @torch.inference_mode()
-def evaluate_model(model, dataloader, device: torch.device, task: str, names: dict[int, str], config: Optional[EvalConfig] = None):
+def evaluate_model(
+    model,
+    dataloader,
+    device: torch.device,
+    task: str,
+    names: dict[int, str],
+    config: Optional[EvalConfig] = None,
+    show_progress: bool = True,
+    progress_update_interval: int = 10,
+):
     config = config or EvalConfig()
     evaluator = build_metric_evaluator(task, names)
     model.eval()
-    for batch in dataloader:
+    pbar = tqdm(dataloader, desc=f"{task} eval", dynamic_ncols=True, leave=False) if show_progress else dataloader
+    for i, batch in enumerate(pbar):
         for key, value in batch.items():
             if isinstance(value, torch.Tensor):
                 batch[key] = value.to(device, non_blocking=device.type == "cuda")
@@ -218,5 +249,13 @@ def evaluate_model(model, dataloader, device: torch.device, task: str, names: di
         raw_preds = model(batch["img"])
         preds = model.postprocess(raw_preds, conf=config.conf, iou=config.iou, max_det=config.max_det)
         evaluator.update(preds, batch)
+        if show_progress and ((i + 1) % max(progress_update_interval, 1) == 0 or (i + 1) == len(dataloader)):
+            running = evaluator.running_results()
+            pbar.set_postfix({
+                "P": f"{running['metrics/precision(B)']:.4f}",
+                "R": f"{running['metrics/recall(B)']:.4f}",
+                "mAP50": f"{running['metrics/mAP50(B)']:.4f}",
+                "mAP50-95": f"{running['metrics/mAP50-95(B)']:.4f}",
+            })
     evaluator.metrics.process()
     return evaluator.metrics.results_dict
