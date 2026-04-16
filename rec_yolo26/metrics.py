@@ -5,6 +5,7 @@ from typing import Any, Optional
 
 import numpy as np
 import torch
+from tqdm.auto import tqdm
 
 from .ops import batch_probiou, box_iou, xywh_to_xyxy
 
@@ -205,17 +206,42 @@ class DetectionMetricEvaluator:
                 }
             )
 
+    def running_results(self) -> dict[str, float]:
+        """Compute current metrics from accumulated stats for progress display."""
+        stats = {k: np.concatenate(v, 0) if len(v) else np.zeros((0,)) for k, v in self.metrics.stats.items()}
+        keys = ["metrics/precision(B)", "metrics/recall(B)", "metrics/mAP50(B)", "metrics/mAP50-95(B)", "fitness"]
+        if not stats["target_cls"].size:
+            return dict(zip(keys, [0.0, 0.0, 0.0, 0.0, 0.0]))
+        results = ap_per_class(stats["tp"], stats["conf"], stats["pred_cls"], stats["target_cls"], names=self.names)[2:]
+        p, r, _f1, all_ap, _cls_idx, *_ = results
+        mp = float(p.mean()) if len(p) else 0.0
+        mr = float(r.mean()) if len(r) else 0.0
+        map50 = float(all_ap[:, 0].mean()) if len(all_ap) else 0.0
+        map5095 = float(all_ap.mean()) if len(all_ap) else 0.0
+        fitness = map5095
+        return dict(zip(keys, [mp, mr, map50, map5095, fitness]))
+
 
 def build_metric_evaluator(task: str, names: dict[int, str]):
     return DetectionMetricEvaluator(task=task, names=names)
 
 
 @torch.inference_mode()
-def evaluate_model(model, dataloader, device: torch.device, task: str, names: dict[int, str], config: Optional[EvalConfig] = None):
+def evaluate_model(
+    model,
+    dataloader,
+    device: torch.device,
+    task: str,
+    names: dict[int, str],
+    config: Optional[EvalConfig] = None,
+    show_progress: bool = True,
+    progress_update_interval: int = 10,
+):
     config = config or EvalConfig()
     evaluator = build_metric_evaluator(task, names)
     model.eval()
-    for batch in dataloader:
+    pbar = tqdm(dataloader, desc=f"{task} eval", dynamic_ncols=True, leave=False) if show_progress else dataloader
+    for i, batch in enumerate(pbar):
         for key, value in batch.items():
             if isinstance(value, torch.Tensor):
                 batch[key] = value.to(device, non_blocking=device.type == "cuda")
@@ -223,5 +249,13 @@ def evaluate_model(model, dataloader, device: torch.device, task: str, names: di
         raw_preds = model(batch["img"])
         preds = model.postprocess(raw_preds, conf=config.conf, iou=config.iou, max_det=config.max_det)
         evaluator.update(preds, batch)
+        if show_progress and ((i + 1) % max(progress_update_interval, 1) == 0 or (i + 1) == len(dataloader)):
+            running = evaluator.running_results()
+            pbar.set_postfix({
+                "P": f"{running['metrics/precision(B)']:.4f}",
+                "R": f"{running['metrics/recall(B)']:.4f}",
+                "mAP50": f"{running['metrics/mAP50(B)']:.4f}",
+                "mAP50-95": f"{running['metrics/mAP50-95(B)']:.4f}",
+            })
     evaluator.metrics.process()
     return evaluator.metrics.results_dict
