@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import importlib
+import importlib.util
 from typing import Any, Optional
 
 import numpy as np
@@ -152,6 +154,12 @@ class DetectionMetricEvaluator:
         self.metrics = OBBMetrics(names) if task == "obb" else DetMetrics(names)
         self.iouv = torch.linspace(0.5, 0.95, 10)
         self.niou = self.iouv.numel()
+        self._coco_gt: list[dict[str, Any]] = []
+        self._coco_pred: list[dict[str, Any]] = []
+        self._image_id_by_file: dict[str, int] = {}
+        self._next_image_id = 1
+        self._obb_gt: list[dict[str, Any]] = []
+        self._obb_pred: list[dict[str, Any]] = []
 
     def _prepare_batch(self, si: int, batch: dict[str, Any]):
         idx = batch["batch_idx"] == si
@@ -163,7 +171,103 @@ class DetectionMetricEvaluator:
                 bbox[..., :4].mul_(torch.tensor(imgsz, device=bbox.device)[[1, 0, 1, 0]])
             else:
                 bbox = xywh_to_xyxy(bbox) * torch.tensor(imgsz, device=bbox.device)[[1, 0, 1, 0]]
-        return {"cls": cls, "bboxes": bbox}
+        return {
+            "cls": cls,
+            "bboxes": bbox,
+            "ori_shape": batch["ori_shape"][si],
+            "ratio_pad": batch["ratio_pad"][si],
+            "im_file": batch["im_file"][si],
+        }
+
+    @staticmethod
+    def _scale_xyxy_to_original(xyxy: torch.Tensor, ratio_pad: tuple[float, tuple[int, int]], ori_shape: tuple[int, int]) -> torch.Tensor:
+        ratio, (padw, padh) = ratio_pad
+        out = xyxy.clone()
+        out[:, [0, 2]] = (out[:, [0, 2]] - float(padw)) / float(ratio)
+        out[:, [1, 3]] = (out[:, [1, 3]] - float(padh)) / float(ratio)
+        h0, w0 = ori_shape
+        out[:, [0, 2]] = out[:, [0, 2]].clamp(0, float(w0))
+        out[:, [1, 3]] = out[:, [1, 3]].clamp(0, float(h0))
+        return out
+
+    @staticmethod
+    def _scale_xywhr_to_original(xywhr: torch.Tensor, ratio_pad: tuple[float, tuple[int, int]], ori_shape: tuple[int, int]) -> torch.Tensor:
+        ratio, (padw, padh) = ratio_pad
+        out = xywhr.clone()
+        out[:, 0] = (out[:, 0] - float(padw)) / float(ratio)
+        out[:, 1] = (out[:, 1] - float(padh)) / float(ratio)
+        out[:, 2] = out[:, 2] / float(ratio)
+        out[:, 3] = out[:, 3] / float(ratio)
+        h0, w0 = ori_shape
+        out[:, 0] = out[:, 0].clamp(0, float(w0))
+        out[:, 1] = out[:, 1].clamp(0, float(h0))
+        out[:, 2] = out[:, 2].clamp(0, float(w0))
+        out[:, 3] = out[:, 3].clamp(0, float(h0))
+        return out
+
+    def _collect_coco_records(self, pred: dict[str, torch.Tensor], pbatch: dict[str, Any]):
+        im_file = pbatch["im_file"]
+        if im_file not in self._image_id_by_file:
+            self._image_id_by_file[im_file] = self._next_image_id
+            self._next_image_id += 1
+        image_id = self._image_id_by_file[im_file]
+        ori_shape = pbatch["ori_shape"]
+        ratio_pad = pbatch["ratio_pad"]
+        if self.task == "obb":
+            gt_cls = pbatch["cls"].detach().cpu().numpy().astype(int)
+            gt_xywhr = self._scale_xywhr_to_original(pbatch["bboxes"], ratio_pad, ori_shape).detach().cpu().numpy()
+            for c, b in zip(gt_cls.tolist(), gt_xywhr.tolist()):
+                cx, cy, w, h, a = b
+                self._obb_gt.append({
+                    "image_id": image_id,
+                    "category_id": int(c),
+                    "bbox": [float(cx), float(cy), float(w), float(h), float(a)],
+                    "area": float(max(w, 0.0) * max(h, 0.0)),
+                })
+            if pred["bboxes"].shape[0]:
+                pred_xywhr = self._scale_xywhr_to_original(pred["bboxes"], ratio_pad, ori_shape).detach().cpu().numpy()
+                pred_cls = pred["cls"].detach().cpu().numpy().astype(int)
+                pred_conf = pred["conf"].detach().cpu().numpy()
+                for c, s, b in zip(pred_cls.tolist(), pred_conf.tolist(), pred_xywhr.tolist()):
+                    cx, cy, w, h, a = b
+                    self._obb_pred.append({
+                        "image_id": image_id,
+                        "category_id": int(c),
+                        "bbox": [float(cx), float(cy), float(w), float(h), float(a)],
+                        "area": float(max(w, 0.0) * max(h, 0.0)),
+                        "score": float(s),
+                    })
+            return
+
+        if self.task != "detect":
+            return
+
+        gt_cls = pbatch["cls"].detach().cpu().numpy().astype(int)
+        gt_xyxy = self._scale_xyxy_to_original(pbatch["bboxes"], ratio_pad, ori_shape).detach().cpu().numpy()
+        for c, b in zip(gt_cls.tolist(), gt_xyxy.tolist()):
+            x1, y1, x2, y2 = b
+            self._coco_gt.append({
+                "id": len(self._coco_gt) + 1,
+                "image_id": image_id,
+                "category_id": int(c),
+                "bbox": [float(x1), float(y1), float(x2 - x1), float(y2 - y1)],
+                "area": float(max(x2 - x1, 0.0) * max(y2 - y1, 0.0)),
+                "iscrowd": 0,
+            })
+
+        if pred["bboxes"].shape[0] == 0:
+            return
+        pred_xyxy = self._scale_xyxy_to_original(pred["bboxes"], ratio_pad, ori_shape).detach().cpu().numpy()
+        pred_cls = pred["cls"].detach().cpu().numpy().astype(int)
+        pred_conf = pred["conf"].detach().cpu().numpy()
+        for c, s, b in zip(pred_cls.tolist(), pred_conf.tolist(), pred_xyxy.tolist()):
+            x1, y1, x2, y2 = b
+            self._coco_pred.append({
+                "image_id": image_id,
+                "category_id": int(c),
+                "bbox": [float(x1), float(y1), float(x2 - x1), float(y2 - y1)],
+                "score": float(s),
+            })
 
     def match_predictions(self, pred_classes: torch.Tensor, true_classes: torch.Tensor, iou: torch.Tensor):
         correct = np.zeros((pred_classes.shape[0], self.niou), dtype=bool)
@@ -194,6 +298,7 @@ class DetectionMetricEvaluator:
     def update(self, preds: list[dict[str, torch.Tensor]], batch: dict[str, Any]):
         for si, pred in enumerate(preds):
             pbatch = self._prepare_batch(si, batch)
+            self._collect_coco_records(pred, pbatch)
             cls = pbatch["cls"].cpu().numpy()
             no_pred = pred["cls"].shape[0] == 0
             self.metrics.update_stats(
@@ -205,6 +310,152 @@ class DetectionMetricEvaluator:
                     "pred_cls": np.zeros(0) if no_pred else pred["cls"].detach().cpu().numpy(),
                 }
             )
+
+    def coco_size_results(self) -> dict[str, float]:
+        """Strict COCO semantic AP for small/medium/large (detect task only)."""
+        if self.task == "obb":
+            return self.obb_coco_size_results()
+        if self.task != "detect":
+            return {}
+        if importlib.util.find_spec("pycocotools") is None:
+            return {}
+        if not self._coco_gt:
+            return {
+                "metrics/mAP50-95_small(B)": 0.0,
+                "metrics/mAP50-95_medium(B)": 0.0,
+                "metrics/mAP50-95_large(B)": 0.0,
+            }
+
+        coco_module = importlib.import_module("pycocotools.coco")
+        cocoeval_module = importlib.import_module("pycocotools.cocoeval")
+        COCO = coco_module.COCO
+        COCOeval = cocoeval_module.COCOeval
+
+        coco_gt = COCO()
+        coco_gt.dataset = {
+            "images": [{"id": i, "file_name": f} for f, i in self._image_id_by_file.items()],
+            "annotations": self._coco_gt,
+            "categories": [{"id": int(i), "name": str(n)} for i, n in self.names.items()],
+        }
+        coco_gt.createIndex()
+
+        coco_dt = coco_gt.loadRes(self._coco_pred) if self._coco_pred else coco_gt.loadRes([])
+        coco_eval = COCOeval(coco_gt, coco_dt, iouType="bbox")
+        coco_eval.params.maxDets = [1, 10, 100]
+        coco_eval.evaluate()
+        coco_eval.accumulate()
+        # stats: [AP, AP50, AP75, AP_small, AP_medium, AP_large, AR1, AR10, AR100, AR_small, AR_medium, AR_large]
+        return {
+            "metrics/mAP50-95_small(B)": float(coco_eval.stats[3]) if coco_eval.stats[3] >= 0 else 0.0,
+            "metrics/mAP50-95_medium(B)": float(coco_eval.stats[4]) if coco_eval.stats[4] >= 0 else 0.0,
+            "metrics/mAP50-95_large(B)": float(coco_eval.stats[5]) if coco_eval.stats[5] >= 0 else 0.0,
+        }
+
+    def obb_coco_size_results(self) -> dict[str, float]:
+        """COCO-style area-range AP for OBB using rotated IoU and COCO AP integration."""
+        if not self._obb_gt:
+            return {
+                "metrics/mAP50-95_small(OBB)": 0.0,
+                "metrics/mAP50-95_medium(OBB)": 0.0,
+                "metrics/mAP50-95_large(OBB)": 0.0,
+            }
+
+        area_ranges = {
+            "small": (0.0, float(32**2)),
+            "medium": (float(32**2), float(96**2)),
+            "large": (float(96**2), float("inf")),
+        }
+        eps = 1e-16
+        iouv = self.iouv.cpu().numpy()
+        results = {}
+        classes = [int(k) for k in self.names.keys()]
+        image_ids = sorted({x["image_id"] for x in self._obb_gt} | {x["image_id"] for x in self._obb_pred})
+
+        for size_name, (amin, amax) in area_ranges.items():
+            ap_cls = []
+            for c in classes:
+                gt_cls = [g for g in self._obb_gt if g["category_id"] == c]
+                if not gt_cls:
+                    continue
+                dt_cls = [d for d in self._obb_pred if d["category_id"] == c]
+                npos = sum(1 for g in gt_cls if amin <= g["area"] < amax)
+                if npos == 0:
+                    continue
+
+                all_conf = []
+                all_tp = []
+                all_fp = []
+                for img_id in image_ids:
+                    gt_img = [g for g in gt_cls if g["image_id"] == img_id]
+                    dt_img = sorted([d for d in dt_cls if d["image_id"] == img_id], key=lambda x: x["score"], reverse=True)[:100]
+                    if not dt_img:
+                        continue
+                    dt_boxes = torch.tensor([d["bbox"] for d in dt_img], dtype=torch.float32)
+                    conf = np.array([d["score"] for d in dt_img], dtype=np.float32)
+                    tp = np.zeros((len(dt_img), self.niou), dtype=bool)
+                    fp = np.zeros((len(dt_img), self.niou), dtype=bool)
+                    if gt_img:
+                        gt_boxes = torch.tensor([g["bbox"] for g in gt_img], dtype=torch.float32)
+                        gt_ignore = np.array([not (amin <= g["area"] < amax) for g in gt_img], dtype=bool)
+                        ious = batch_probiou(gt_boxes, dt_boxes).cpu().numpy()  # GxD
+                        for t_idx, thr in enumerate(iouv.tolist()):
+                            matched = set()
+                            for d_idx in range(len(dt_img)):
+                                # Match non-ignore GT first
+                                best_g = -1
+                                best_iou = thr
+                                for g_idx in np.where(~gt_ignore)[0]:
+                                    if g_idx in matched:
+                                        continue
+                                    if ious[g_idx, d_idx] >= best_iou:
+                                        best_iou = ious[g_idx, d_idx]
+                                        best_g = int(g_idx)
+                                if best_g >= 0:
+                                    tp[d_idx, t_idx] = True
+                                    matched.add(best_g)
+                                    continue
+                                # Match ignore GT -> ignored detection (neither TP nor FP)
+                                ignore_match = -1
+                                best_iou = thr
+                                for g_idx in np.where(gt_ignore)[0]:
+                                    if g_idx in matched:
+                                        continue
+                                    if ious[g_idx, d_idx] >= best_iou:
+                                        best_iou = ious[g_idx, d_idx]
+                                        ignore_match = int(g_idx)
+                                if ignore_match >= 0:
+                                    matched.add(ignore_match)
+                                    continue
+                                fp[d_idx, t_idx] = True
+                    else:
+                        fp[:] = True
+                    all_conf.append(conf)
+                    all_tp.append(tp)
+                    all_fp.append(fp)
+
+                if not all_conf:
+                    ap_cls.append(np.zeros(self.niou, dtype=np.float32))
+                    continue
+                conf = np.concatenate(all_conf, axis=0)
+                tp = np.concatenate(all_tp, axis=0)
+                fp = np.concatenate(all_fp, axis=0)
+                order = np.argsort(-conf)
+                tp = tp[order]
+                fp = fp[order]
+
+                ap_t = np.zeros(self.niou, dtype=np.float32)
+                for t_idx in range(self.niou):
+                    tpc = tp[:, t_idx].cumsum(0)
+                    fpc = fp[:, t_idx].cumsum(0)
+                    recall = tpc / (npos + eps)
+                    precision = tpc / (tpc + fpc + eps)
+                    ap_t[t_idx], _, _ = compute_ap(recall, precision)
+                ap_cls.append(ap_t)
+
+            map5095 = float(np.stack(ap_cls, axis=0).mean()) if ap_cls else 0.0
+            results[f"metrics/mAP50-95_{size_name}(OBB)"] = map5095
+
+        return results
 
     def running_results(self) -> dict[str, float]:
         """Compute current metrics from accumulated stats for progress display."""
@@ -258,4 +509,6 @@ def evaluate_model(
                 "mAP50-95": f"{running['metrics/mAP50-95(B)']:.4f}",
             })
     evaluator.metrics.process()
-    return evaluator.metrics.results_dict
+    results = evaluator.metrics.results_dict
+    results.update(evaluator.coco_size_results())
+    return results
