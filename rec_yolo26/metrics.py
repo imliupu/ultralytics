@@ -369,66 +369,93 @@ class DetectionMetricEvaluator:
         iouv = self.iouv.cpu().numpy()
         results = {}
         classes = [int(k) for k in self.names.keys()]
-        image_ids = sorted({x["image_id"] for x in self._obb_gt} | {x["image_id"] for x in self._obb_pred})
+
+        # Pre-index records by class+image and precompute IoU matrix once to avoid repeated heavy computation.
+        gt_by_class_img: dict[int, dict[int, list[dict[str, Any]]]] = {c: {} for c in classes}
+        dt_by_class_img: dict[int, dict[int, list[dict[str, Any]]]] = {c: {} for c in classes}
+        for g in self._obb_gt:
+            c = int(g["category_id"])
+            if c in gt_by_class_img:
+                gt_by_class_img[c].setdefault(int(g["image_id"]), []).append(g)
+        for d in self._obb_pred:
+            c = int(d["category_id"])
+            if c in dt_by_class_img:
+                dt_by_class_img[c].setdefault(int(d["image_id"]), []).append(d)
+
+        cache: dict[int, dict[int, dict[str, Any]]] = {c: {} for c in classes}
+        for c in classes:
+            image_ids = sorted(set(gt_by_class_img[c].keys()) | set(dt_by_class_img[c].keys()))
+            for img_id in image_ids:
+                gt_img = gt_by_class_img[c].get(img_id, [])
+                dt_img = dt_by_class_img[c].get(img_id, [])
+                dt_img = sorted(dt_img, key=lambda x: x["score"], reverse=True)[:100]
+
+                gt_boxes = torch.tensor([g["bbox"] for g in gt_img], dtype=torch.float32) if gt_img else torch.zeros((0, 5), dtype=torch.float32)
+                gt_area = np.array([g["area"] for g in gt_img], dtype=np.float32) if gt_img else np.zeros((0,), dtype=np.float32)
+                dt_boxes = torch.tensor([d["bbox"] for d in dt_img], dtype=torch.float32) if dt_img else torch.zeros((0, 5), dtype=torch.float32)
+                dt_conf = np.array([d["score"] for d in dt_img], dtype=np.float32) if dt_img else np.zeros((0,), dtype=np.float32)
+                ious = batch_probiou(gt_boxes, dt_boxes).cpu().numpy() if (len(gt_img) and len(dt_img)) else np.zeros((len(gt_img), len(dt_img)), dtype=np.float32)
+                cache[c][img_id] = {"gt_area": gt_area, "dt_conf": dt_conf, "ious": ious}
+
+        def match_one_image(ious: np.ndarray, gt_ignore: np.ndarray, thr: float) -> tuple[np.ndarray, np.ndarray]:
+            nd = ious.shape[1]
+            tp = np.zeros((nd,), dtype=bool)
+            fp = np.zeros((nd,), dtype=bool)
+            if nd == 0:
+                return tp, fp
+            if ious.shape[0] == 0:
+                fp[:] = True
+                return tp, fp
+
+            non_ignore_idx = np.where(~gt_ignore)[0]
+            ignore_idx = np.where(gt_ignore)[0]
+            matched = np.zeros((ious.shape[0],), dtype=bool)
+            for d_idx in range(nd):
+                # Match non-ignore GT first.
+                if non_ignore_idx.size:
+                    cand = non_ignore_idx[~matched[non_ignore_idx]]
+                    if cand.size:
+                        cand_iou = ious[cand, d_idx]
+                        j = cand_iou.argmax()
+                        if cand_iou[j] >= thr:
+                            g_idx = cand[j]
+                            matched[g_idx] = True
+                            tp[d_idx] = True
+                            continue
+                # Match ignore GT (detection ignored, neither TP nor FP).
+                if ignore_idx.size:
+                    cand = ignore_idx[~matched[ignore_idx]]
+                    if cand.size:
+                        cand_iou = ious[cand, d_idx]
+                        j = cand_iou.argmax()
+                        if cand_iou[j] >= thr:
+                            matched[cand[j]] = True
+                            continue
+                fp[d_idx] = True
+            return tp, fp
 
         for size_name, (amin, amax) in area_ranges.items():
             ap_cls = []
             for c in classes:
-                gt_cls = [g for g in self._obb_gt if g["category_id"] == c]
-                if not gt_cls:
-                    continue
-                dt_cls = [d for d in self._obb_pred if d["category_id"] == c]
-                npos = sum(1 for g in gt_cls if amin <= g["area"] < amax)
+                npos = 0
+                for item in cache[c].values():
+                    gt_area = item["gt_area"]
+                    npos += int(((gt_area >= amin) & (gt_area < amax)).sum())
                 if npos == 0:
                     continue
 
-                all_conf = []
-                all_tp = []
-                all_fp = []
-                for img_id in image_ids:
-                    gt_img = [g for g in gt_cls if g["image_id"] == img_id]
-                    dt_img = sorted([d for d in dt_cls if d["image_id"] == img_id], key=lambda x: x["score"], reverse=True)[:100]
-                    if not dt_img:
+                all_conf, all_tp, all_fp = [], [], []
+                for item in cache[c].values():
+                    conf = item["dt_conf"]
+                    if conf.size == 0:
                         continue
-                    dt_boxes = torch.tensor([d["bbox"] for d in dt_img], dtype=torch.float32)
-                    conf = np.array([d["score"] for d in dt_img], dtype=np.float32)
-                    tp = np.zeros((len(dt_img), self.niou), dtype=bool)
-                    fp = np.zeros((len(dt_img), self.niou), dtype=bool)
-                    if gt_img:
-                        gt_boxes = torch.tensor([g["bbox"] for g in gt_img], dtype=torch.float32)
-                        gt_ignore = np.array([not (amin <= g["area"] < amax) for g in gt_img], dtype=bool)
-                        ious = batch_probiou(gt_boxes, dt_boxes).cpu().numpy()  # GxD
-                        for t_idx, thr in enumerate(iouv.tolist()):
-                            matched = set()
-                            for d_idx in range(len(dt_img)):
-                                # Match non-ignore GT first
-                                best_g = -1
-                                best_iou = thr
-                                for g_idx in np.where(~gt_ignore)[0]:
-                                    if g_idx in matched:
-                                        continue
-                                    if ious[g_idx, d_idx] >= best_iou:
-                                        best_iou = ious[g_idx, d_idx]
-                                        best_g = int(g_idx)
-                                if best_g >= 0:
-                                    tp[d_idx, t_idx] = True
-                                    matched.add(best_g)
-                                    continue
-                                # Match ignore GT -> ignored detection (neither TP nor FP)
-                                ignore_match = -1
-                                best_iou = thr
-                                for g_idx in np.where(gt_ignore)[0]:
-                                    if g_idx in matched:
-                                        continue
-                                    if ious[g_idx, d_idx] >= best_iou:
-                                        best_iou = ious[g_idx, d_idx]
-                                        ignore_match = int(g_idx)
-                                if ignore_match >= 0:
-                                    matched.add(ignore_match)
-                                    continue
-                                fp[d_idx, t_idx] = True
-                    else:
-                        fp[:] = True
+                    gt_area = item["gt_area"]
+                    gt_ignore = ~((gt_area >= amin) & (gt_area < amax))
+                    ious = item["ious"]
+                    tp = np.zeros((conf.shape[0], self.niou), dtype=bool)
+                    fp = np.zeros((conf.shape[0], self.niou), dtype=bool)
+                    for t_idx, thr in enumerate(iouv.tolist()):
+                        tp[:, t_idx], fp[:, t_idx] = match_one_image(ious, gt_ignore, thr)
                     all_conf.append(conf)
                     all_tp.append(tp)
                     all_fp.append(fp)
@@ -436,6 +463,7 @@ class DetectionMetricEvaluator:
                 if not all_conf:
                     ap_cls.append(np.zeros(self.niou, dtype=np.float32))
                     continue
+
                 conf = np.concatenate(all_conf, axis=0)
                 tp = np.concatenate(all_tp, axis=0)
                 fp = np.concatenate(all_fp, axis=0)
@@ -452,8 +480,7 @@ class DetectionMetricEvaluator:
                     ap_t[t_idx], _, _ = compute_ap(recall, precision)
                 ap_cls.append(ap_t)
 
-            map5095 = float(np.stack(ap_cls, axis=0).mean()) if ap_cls else 0.0
-            results[f"metrics/mAP50-95_{size_name}(OBB)"] = map5095
+            results[f"metrics/mAP50-95_{size_name}(OBB)"] = float(np.stack(ap_cls, axis=0).mean()) if ap_cls else 0.0
 
         return results
 
