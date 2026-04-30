@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import math
+import logging
 from typing import Any
 
 import torch
 import torch.nn as nn
 
-from .ops import bbox2dist, bbox_iou, dist2bbox, dist2rbox, make_anchors, probiou, rbox2dist
+from .ops import bbox2dist, bbox_iou, dist2bbox, dist2rbox, make_anchors, probiou, rbox2dist, xywh_to_xyxy, xyxy_to_xywh
+
+LOGGER = logging.getLogger(__name__)
 
 
 class BboxLoss(nn.Module):
@@ -49,7 +52,14 @@ class RotatedBboxLoss(BboxLoss):
 
 class TaskAlignedAssigner(nn.Module):
     def __init__(
-        self, topk: int = 13, num_classes: int = 80, alpha: float = 1.0, beta: float = 6.0, eps: float = 1e-9, topk2=None
+        self,
+        topk: int = 13,
+        num_classes: int = 80,
+        alpha: float = 1.0,
+        beta: float = 6.0,
+        stride: list = [8, 16, 32],
+        eps: float = 1e-9,
+        topk2=None,
     ):
         super().__init__()
         self.topk = topk
@@ -63,6 +73,7 @@ class TaskAlignedAssigner(nn.Module):
     def forward(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt):
         self.bs = pd_scores.shape[0]
         self.n_max_boxes = gt_bboxes.shape[1]
+        device = gt_bboxes.device
         if self.n_max_boxes == 0:
             return (
                 torch.full_like(pd_scores[..., 0], self.num_classes),
@@ -71,7 +82,17 @@ class TaskAlignedAssigner(nn.Module):
                 torch.zeros_like(pd_scores[..., 0]),
                 torch.zeros_like(pd_scores[..., 0]),
             )
+        try:
+            return self._forward(pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt)
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                LOGGER.warning("CUDA OutOfMemoryError in TaskAlignedAssigner, using CPU")
+                cpu_tensors = [t.cpu() for t in (pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt)]
+                result = self._forward(*cpu_tensors)
+                return tuple(t.to(device) for t in result)
+            raise
 
+    def _forward(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt):
         mask_pos, align_metric, overlaps = self.get_pos_mask(
             pd_scores, pd_bboxes, gt_labels, gt_bboxes, anc_points, mask_gt
         )
@@ -87,7 +108,7 @@ class TaskAlignedAssigner(nn.Module):
         return target_labels, target_bboxes, target_scores, fg_mask.bool(), target_gt_idx
 
     def get_pos_mask(self, pd_scores, pd_bboxes, gt_labels, gt_bboxes, anc_points, mask_gt):
-        mask_in_gts = self.select_candidates_in_gts(anc_points, gt_bboxes)
+        mask_in_gts = self.select_candidates_in_gts(anc_points, gt_bboxes, mask_gt)
         align_metric, overlaps = self.get_box_metrics(
             pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_in_gts * mask_gt
         )
@@ -149,7 +170,15 @@ class TaskAlignedAssigner(nn.Module):
 
         return target_labels, target_bboxes, target_scores
 
-    def select_candidates_in_gts(self, xy_centers, gt_bboxes, eps=1e-9):
+    def select_candidates_in_gts(self, xy_centers, gt_bboxes, mask_gt, eps=1e-9):
+        gt_bboxes_xywh = xyxy_to_xywh(gt_bboxes)
+        wh_mask = gt_bboxes_xywh[..., 2:] < self.stride[0]
+        gt_bboxes_xywh[..., 2:] = torch.where(
+            (wh_mask * mask_gt).bool(),
+            torch.tensor(self.stride_val, dtype=gt_bboxes_xywh.dtype, device=gt_bboxes_xywh.device),
+            gt_bboxes_xywh[..., 2:],
+        )
+        gt_bboxes = xywh_to_xyxy(gt_bboxes_xywh)
         n_anchors = xy_centers.shape[0]
         bs, n_boxes, _ = gt_bboxes.shape
         lt, rb = gt_bboxes.view(-1, 1, 4).chunk(2, 2)
