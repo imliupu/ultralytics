@@ -6,47 +6,93 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .ops import bbox2dist, bbox_iou, dist2bbox, dist2rbox, make_anchors, probiou, rbox2dist, xywh_to_xyxy, xyxy_to_xywh
 
 LOGGER = logging.getLogger(__name__)
 
 
-class BboxLoss(nn.Module):
-    def __init__(self, reg_max: int):
+class DFLoss(nn.Module):
+    """Criterion class for computing Distribution Focal Loss (DFL)."""
+
+    def __init__(self, reg_max: int = 16) -> None:
+        """Initialize the DFL module with regularization maximum."""
         super().__init__()
         self.reg_max = reg_max
 
-    def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask, imgsz, stride_tensor):
-        weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-        iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True).squeeze(-1)
-        loss_iou = ((1.0 - iou) * weight.squeeze(-1)).sum() / target_scores_sum
-        loss_dfl = pred_dist.new_tensor(0.0)
-        if self.reg_max > 1:
-            target_ltrb = bbox2dist(anchor_points, target_bboxes, self.reg_max)
-            loss_dfl = self._df_loss(pred_dist[fg_mask].view(-1, self.reg_max), target_ltrb[fg_mask].view(-1))
-            loss_dfl = (loss_dfl.view(-1, 4).mean(-1, keepdim=True) * weight).sum() / target_scores_sum
-        return loss_iou, loss_dfl
-
-    @staticmethod
-    def _df_loss(pred_dist: torch.Tensor, target: torch.Tensor):
+    def __call__(self, pred_dist: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Return sum of left and right DFL losses."""
+        target = target.clamp_(0, self.reg_max - 1 - 0.01)
         tl = target.long()
         tr = tl + 1
         wl = tr - target
         wr = 1 - wl
-        return nn.functional.cross_entropy(pred_dist, tl.view(-1), reduction="none") * wl + nn.functional.cross_entropy(pred_dist, tr.clamp(max=pred_dist.shape[-1] - 1).view(-1), reduction="none") * wr
+        return (
+            F.cross_entropy(pred_dist, tl.view(-1), reduction="none").view(tl.shape) * wl
+            + F.cross_entropy(pred_dist, tr.view(-1), reduction="none").view(tl.shape) * wr
+        ).mean(-1, keepdim=True)
+
+
+class BboxLoss(nn.Module):
+    """Criterion class for computing training losses for bounding boxes."""
+
+    def __init__(self, reg_max: int = 16):
+        """Initialize the BboxLoss module with regularization maximum and DFL settings."""
+        super().__init__()
+        self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
+
+    def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask, imgsz, stride):
+        """Compute IoU and DFL losses for bounding boxes."""
+        weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+        iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+        loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+
+        if self.dfl_loss:
+            target_ltrb = bbox2dist(anchor_points, target_bboxes, self.dfl_loss.reg_max - 1)
+            loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask]) * weight
+            loss_dfl = loss_dfl.sum() / target_scores_sum
+        else:
+            target_ltrb = bbox2dist(anchor_points, target_bboxes)
+            target_ltrb = target_ltrb * stride
+            target_ltrb[..., 0::2] /= imgsz[1]
+            target_ltrb[..., 1::2] /= imgsz[0]
+            pred_dist = pred_dist * stride
+            pred_dist[..., 0::2] /= imgsz[1]
+            pred_dist[..., 1::2] /= imgsz[0]
+            loss_dfl = F.l1_loss(pred_dist[fg_mask], target_ltrb[fg_mask], reduction="none").mean(-1, keepdim=True) * weight
+            loss_dfl = loss_dfl.sum() / target_scores_sum
+
+        return loss_iou, loss_dfl
 
 
 class RotatedBboxLoss(BboxLoss):
-    def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask, imgsz, stride_tensor):
-        weight = target_scores.sum(-1)[fg_mask]
-        iou = probiou(pred_bboxes[fg_mask], target_bboxes[fg_mask]).squeeze(-1)
+    """Criterion class for computing training losses for rotated bounding boxes."""
+
+    def __init__(self, reg_max: int):
+        super().__init__(reg_max)
+
+    def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask, imgsz, stride):
+        """Compute IoU and DFL losses for rotated bounding boxes."""
+        weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+        iou = probiou(pred_bboxes[fg_mask], target_bboxes[fg_mask])
         loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
-        loss_dfl = pred_dist.new_tensor(0.0)
-        if self.reg_max > 1:
-            target_ltrb = rbox2dist(target_bboxes[..., :4], anchor_points, target_bboxes[..., 4:5], self.reg_max)
-            loss_dfl = self._df_loss(pred_dist[fg_mask].view(-1, self.reg_max), target_ltrb[fg_mask].view(-1))
-            loss_dfl = (loss_dfl.view(-1, 4).mean(-1) * weight.repeat_interleave(4)[: loss_dfl.view(-1, 4).shape[0]]).sum() / target_scores_sum
+
+        if self.dfl_loss:
+            target_ltrb = rbox2dist(target_bboxes[..., :4], anchor_points, target_bboxes[..., 4:5], reg_max=self.dfl_loss.reg_max - 1)
+            loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask]) * weight
+            loss_dfl = loss_dfl.sum() / target_scores_sum
+        else:
+            target_ltrb = rbox2dist(target_bboxes[..., :4], anchor_points, target_bboxes[..., 4:5])
+            target_ltrb = target_ltrb * stride
+            target_ltrb[..., 0::2] /= imgsz[1]
+            target_ltrb[..., 1::2] /= imgsz[0]
+            pred_dist = pred_dist * stride
+            pred_dist[..., 0::2] /= imgsz[1]
+            pred_dist[..., 1::2] /= imgsz[0]
+            loss_dfl = F.l1_loss(pred_dist[fg_mask], target_ltrb[fg_mask], reduction="none").mean(-1, keepdim=True) * weight
+            loss_dfl = loss_dfl.sum() / target_scores_sum
+
         return loss_iou, loss_dfl
 
 
