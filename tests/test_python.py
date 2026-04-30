@@ -519,6 +519,13 @@ def test_utils_ops():
     boxes[:, 4] = torch.randn(10) * 30
     torch.allclose(boxes, xyxyxyxy2xywhr(xywhr2xyxyxyxy(boxes)), rtol=1e-3)
 
+    # Non-rectangular 4-point polygons are projected to min-area rectangles and are not losslessly invertible.
+    poly = torch.tensor(
+        [[22.21, 17.74, 38.19, 21.56, 28.54, 61.54, 12.56, 57.73]], dtype=torch.float32
+    )  # parallelogram
+    recon = xywhr2xyxyxyxy(xyxyxyxy2xywhr(poly)).reshape(1, 8)
+    assert not torch.allclose(poly, recon, atol=1e-3)
+
 
 def test_utils_files(tmp_path):
     """Test file handling utilities including file age, date, and paths with spaces."""
