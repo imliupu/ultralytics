@@ -113,8 +113,6 @@ class TaskAlignedAssigner(nn.Module):
         self.num_classes = num_classes
         self.alpha = alpha
         self.beta = beta
-        self.stride = stride
-        self.stride_val = self.stride[1] if len(self.stride) > 1 else self.stride[0]
         self.eps = eps
 
     @torch.no_grad()
