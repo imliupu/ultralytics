@@ -144,11 +144,7 @@ class RecYOLO26Model(nn.Module):
 
     @classmethod
     def build(cls, task: str, nc: int, model: str = "yolo26", scale: str = "n", ch: int = 3, verbose: bool = False, args_overrides: Optional[dict[str, Any]] = None):
-        if task == "obb" and model.lower().replace("_", "-") in {"yolo26-obb-static", "yolo26n-obb-static", "yolo26obb-static"}:
-            instance = YOLO26nOBBStatic(nc=nc)
-            if verbose:
-                print(f"Built static {task} model with {sum(p.numel() for p in instance.parameters()):,} params")
-            return instance
+        static_requested = task == "obb" and model.lower().replace("_", "-") in {"yolo26-obb-static", "yolo26n-obb-static", "yolo26obb-static"}
 
         cfg_path = cls.resolve_model_cfg(model, task)
         cfg = yaml_load(cfg_path)
@@ -156,6 +152,13 @@ class RecYOLO26Model(nn.Module):
             cfg["end2end"] = bool(args_overrides["end2end"])
         layers, save, cfg = build_model_from_yaml(cfg=cfg, task=task, scale=scale, ch=ch, nc=nc)
         instance = cls(layers=layers, save=save, task=task, cfg=cfg, cfg_path=cfg_path, ch=ch)
+        if static_requested:
+            static_impl = YOLO26nOBBStatic(nc=nc)
+            instance.static_impl = static_impl
+            instance.model = static_impl.model
+            instance.stride = static_impl.stride
+            instance.model[-1].stride = instance.stride
+            instance._predict_once = static_impl.forward
         if args_overrides:
             for k, v in args_overrides.items():
                 setattr(instance.args, k, v)
