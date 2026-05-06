@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 
 from .loss import build_criterion
-from .modules import C2PSA, C3k2, Conv, Detect, OBB26, SPPF
+from .modules import C2PSA, C3k2, Concat, Conv, Detect, OBB26, SPPF
 from .ops import build_model_from_yaml, dist2bbox, dist2rbox, make_anchors, non_max_suppression, yaml_load
 
 CONFIG_DIR = Path(__file__).resolve().parent / "configs"
@@ -59,10 +59,13 @@ class YOLO26nOBBStatic(nn.Module):
         self.m11 = nn.Upsample(scale_factor=2, mode="nearest")
         self.m13 = C3k2(384, 128, 1, True)
         self.m14 = nn.Upsample(scale_factor=2, mode="nearest")
+        self.cat12 = Concat(1)
         self.m16 = C3k2(256, 64, 1, True)
         self.m17 = Conv(64, 64, 3, 2)
+        self.cat18 = Concat(1)
         self.m19 = C3k2(192, 128, 1, True)
         self.m20 = Conv(128, 128, 3, 2)
+        self.cat21 = Concat(1)
         self.m22 = C3k2(384, 256, 1, True, 0.5, True)
         self.m23 = OBB26(self.nc, 1, 1, True, [64, 128, 256])
         self.model = nn.ModuleList([self.m0,self.m1,self.m2,self.m3,self.m4,self.m5,self.m6,self.m7,self.m8,self.m9,self.m10,self.m11,self.m13,self.m14,self.m16,self.m17,self.m19,self.m20,self.m22,self.m23])
@@ -75,10 +78,10 @@ class YOLO26nOBBStatic(nn.Module):
         x3 = self.m3(x2); x4 = self.m4(x3)
         x5 = self.m5(x4); x6 = self.m6(x5)
         x7 = self.m7(x6); x8 = self.m8(x7); x9 = self.m9(x8); x10 = self.m10(x9)
-        x11 = self.m11(x10); x13 = self.m13(torch.cat((x11, x6), 1))
-        x14 = self.m14(x13); p3 = self.m16(torch.cat((x14, x4), 1))
-        x17 = self.m17(p3); p4 = self.m19(torch.cat((x17, x13), 1))
-        x20 = self.m20(p4); p5 = self.m22(torch.cat((x20, x10), 1))
+        x11 = self.m11(x10); x13 = self.m13(self.cat12([x11, x6]))
+        x14 = self.m14(x13); p3 = self.m16(self.cat12([x14, x4]))
+        x17 = self.m17(p3); p4 = self.m19(self.cat18([x17, x13]))
+        x20 = self.m20(p4); p5 = self.m22(self.cat21([x20, x10]))
         return p3, p4, p5
 
     def forward(self, x):
@@ -87,22 +90,6 @@ class YOLO26nOBBStatic(nn.Module):
         p3, p4, p5 = self.forward_features(x)
         return self.m23([p3, p4, p5])
 
-    def loss(self, batch: dict[str, torch.Tensor], preds=None):
-        if self.criterion is None:
-            self.criterion = build_criterion(self, self.task)
-        if preds is None:
-            preds = self.forward(batch["img"])
-        return self.criterion(preds, batch)
-
-    def decode_predictions(self, preds):
-        return RecYOLO26Model.decode_predictions(self, preds)
-
-    @torch.inference_mode()
-    def postprocess(self, raw_preds, conf: float = 0.25, iou: float = 0.7, max_det: int = 300):
-        return RecYOLO26Model.postprocess(self, raw_preds, conf=conf, iou=iou, max_det=max_det)
-
-    def fuse(self):
-        return RecYOLO26Model.fuse(self)
 
 
 class RecYOLO26Model(nn.Module):
@@ -119,6 +106,7 @@ class RecYOLO26Model(nn.Module):
         self.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5, angle=1.0, epochs=100)
         self.end2end = bool(getattr(self.model[-1], "end2end", False))
         self.criterion = None
+        self.static_requested = False
         self.stride = self._infer_stride(ch)
         self.model[-1].stride = self.stride
         self._initialize_modules()
@@ -152,6 +140,7 @@ class RecYOLO26Model(nn.Module):
             cfg["end2end"] = bool(args_overrides["end2end"])
         layers, save, cfg = build_model_from_yaml(cfg=cfg, task=task, scale=scale, ch=ch, nc=nc)
         instance = cls(layers=layers, save=save, task=task, cfg=cfg, cfg_path=cfg_path, ch=ch)
+        instance.static_requested = static_requested
         if static_requested:
             static_impl = YOLO26nOBBStatic(nc=nc)
             instance.static_impl = static_impl
@@ -358,9 +347,16 @@ class RecYOLO26Model(nn.Module):
     def load(self, path: Union[str, Path], strict: bool = True) -> None:
         checkpoint = torch.load(path, map_location="cpu")
         state_dict = checkpoint.get("model", checkpoint)
-        if hasattr(state_dict, "state_dict"):
-            state_dict = state_dict.state_dict()
-        self.load_state_dict(state_dict, strict=strict)
+        if self.static_requested:
+            if hasattr(state_dict, "model") and hasattr(state_dict.model, "state_dict"):
+                state_dict = state_dict.model.state_dict()
+            elif hasattr(state_dict, "state_dict"):
+                state_dict = state_dict.state_dict()
+            self.model.load_state_dict(state_dict, strict=strict)
+        else:
+            if hasattr(state_dict, "state_dict"):
+                state_dict = state_dict.state_dict()
+            self.load_state_dict(state_dict, strict=strict)
         self.names = checkpoint.get("names", self.names)
         self.model.names = self.names
 
