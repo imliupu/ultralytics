@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 
 from .loss import build_criterion
-from .modules import Detect
+from .modules import C2PSA, C3k2, Conv, Detect, OBB26, SPPF
 from .ops import build_model_from_yaml, dist2bbox, dist2rbox, make_anchors, non_max_suppression, yaml_load
 
 CONFIG_DIR = Path(__file__).resolve().parent / "configs"
@@ -28,6 +28,81 @@ class ModelBuildConfig:
     model: str = "yolo26"
     scale: str = "n"
     ch: int = 3
+
+
+
+
+class YOLO26nOBBStatic(nn.Module):
+    """Static YOLO26n-OBB topology without dynamic route parsing."""
+
+    def __init__(self, nc: int = 80):
+        super().__init__()
+        self.task = "obb"
+        self.nc = int(nc)
+        self.names = {i: str(i) for i in range(self.nc)}
+        self.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5, angle=1.0, epochs=100)
+        self.criterion = None
+        self.end2end = False
+
+        self.m0 = Conv(3, 16, 3, 2)
+        self.m1 = Conv(16, 32, 3, 2)
+        self.m2 = C3k2(32, 64, 1, False, 0.25)
+        self.m3 = Conv(64, 64, 3, 2)
+        self.m4 = C3k2(64, 128, 1, False, 0.25)
+        self.m5 = Conv(128, 128, 3, 2)
+        self.m6 = C3k2(128, 128, 1, True)
+        self.m7 = Conv(128, 256, 3, 2)
+        self.m8 = C3k2(256, 256, 1, True)
+        self.m9 = SPPF(256, 256, 5, 3, True)
+        self.m10 = C2PSA(256, 256, 1)
+
+        self.m11 = nn.Upsample(scale_factor=2, mode="nearest")
+        self.m13 = C3k2(384, 128, 1, True)
+        self.m14 = nn.Upsample(scale_factor=2, mode="nearest")
+        self.m16 = C3k2(256, 64, 1, True)
+        self.m17 = Conv(64, 64, 3, 2)
+        self.m19 = C3k2(192, 128, 1, True)
+        self.m20 = Conv(128, 128, 3, 2)
+        self.m22 = C3k2(384, 256, 1, True, 0.5, True)
+        self.m23 = OBB26(self.nc, 1, 1, True, [64, 128, 256])
+        self.model = nn.ModuleList([self.m0,self.m1,self.m2,self.m3,self.m4,self.m5,self.m6,self.m7,self.m8,self.m9,self.m10,self.m11,self.m13,self.m14,self.m16,self.m17,self.m19,self.m20,self.m22,self.m23])
+
+        self.stride = torch.tensor([8.0, 16.0, 32.0], dtype=torch.float32)
+        self.m23.stride = self.stride
+
+    def forward_features(self, x: torch.Tensor):
+        x0 = self.m0(x); x1 = self.m1(x0); x2 = self.m2(x1)
+        x3 = self.m3(x2); x4 = self.m4(x3)
+        x5 = self.m5(x4); x6 = self.m6(x5)
+        x7 = self.m7(x6); x8 = self.m8(x7); x9 = self.m9(x8); x10 = self.m10(x9)
+        x11 = self.m11(x10); x13 = self.m13(torch.cat((x11, x6), 1))
+        x14 = self.m14(x13); p3 = self.m16(torch.cat((x14, x4), 1))
+        x17 = self.m17(p3); p4 = self.m19(torch.cat((x17, x13), 1))
+        x20 = self.m20(p4); p5 = self.m22(torch.cat((x20, x10), 1))
+        return p3, p4, p5
+
+    def forward(self, x):
+        if isinstance(x, dict):
+            return self.loss(x)
+        p3, p4, p5 = self.forward_features(x)
+        return self.m23([p3, p4, p5])
+
+    def loss(self, batch: dict[str, torch.Tensor], preds=None):
+        if self.criterion is None:
+            self.criterion = build_criterion(self, self.task)
+        if preds is None:
+            preds = self.forward(batch["img"])
+        return self.criterion(preds, batch)
+
+    def decode_predictions(self, preds):
+        return RecYOLO26Model.decode_predictions(self, preds)
+
+    @torch.inference_mode()
+    def postprocess(self, raw_preds, conf: float = 0.25, iou: float = 0.7, max_det: int = 300):
+        return RecYOLO26Model.postprocess(self, raw_preds, conf=conf, iou=iou, max_det=max_det)
+
+    def fuse(self):
+        return RecYOLO26Model.fuse(self)
 
 
 class RecYOLO26Model(nn.Module):
@@ -69,6 +144,12 @@ class RecYOLO26Model(nn.Module):
 
     @classmethod
     def build(cls, task: str, nc: int, model: str = "yolo26", scale: str = "n", ch: int = 3, verbose: bool = False, args_overrides: Optional[dict[str, Any]] = None):
+        if task == "obb" and model.lower().replace("_", "-") in {"yolo26-obb-static", "yolo26n-obb-static", "yolo26obb-static"}:
+            instance = YOLO26nOBBStatic(nc=nc)
+            if verbose:
+                print(f"Built static {task} model with {sum(p.numel() for p in instance.parameters()):,} params")
+            return instance
+
         cfg_path = cls.resolve_model_cfg(model, task)
         cfg = yaml_load(cfg_path)
         if args_overrides and "end2end" in args_overrides:
