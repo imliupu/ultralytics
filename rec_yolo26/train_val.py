@@ -54,6 +54,13 @@ def parse_imgsz(values: list[int]) -> tuple[int, int]:
     raise ValueError(f"--imgsz expects one int or two ints, got: {values}")
 
 
+def check_imgsz_train_val(imgsz: tuple[int, int], stride: int) -> tuple[int, int]:
+    """Align with Ultralytics train/val behavior: force square imgsz and stride-multiple."""
+    base = max(imgsz)
+    aligned = max(int(math.ceil(base / stride) * stride), stride)
+    return aligned, aligned
+
+
 def move_batch_to_device(batch: dict, device: torch.device) -> dict:
     for key, value in batch.items():
         if isinstance(value, torch.Tensor):
@@ -119,6 +126,7 @@ def main(args):
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     model = RecYOLO26Model.build(task=args.task, nc=1, model=args.model, verbose=not args.quiet)
+    imgsz = check_imgsz_train_val(imgsz, int(max(model.stride.max().item(), 32)))
     data, train_loader, val_loader = create_train_val_dataloaders(
         args.data,
         args.task,
