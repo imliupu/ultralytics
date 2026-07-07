@@ -10,7 +10,8 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from ultralytics.data import build_dataloader, build_yolo_dataset, converter
+from ultralytics.data import converter
+from ultralytics.models.yolo.dataset import build_dataloader, build_yolo_dataset
 from ultralytics.engine.validator import BaseValidator
 from ultralytics.utils import LOGGER, RANK, nms, ops
 from ultralytics.utils.checks import check_requirements
